@@ -1,6 +1,7 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs').promises;
+const crypto = require('crypto');
 const { Logger } = require('../utils/logger');
 
 class Database {
@@ -408,6 +409,27 @@ class Database {
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (production_id) REFERENCES productions(id)
       )`,
+      `CREATE TABLE IF NOT EXISTS content_approvals (
+        production_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+        review_notes TEXT,
+        reviewed_by TEXT,
+        reviewed_at TEXT,
+        approved_revision TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (production_id) REFERENCES productions(id)
+      )`,
+      `CREATE TABLE IF NOT EXISTS content_approval_events (
+        id TEXT PRIMARY KEY,
+        production_id TEXT NOT NULL,
+        previous_status TEXT CHECK (previous_status IS NULL OR previous_status IN ('pending', 'approved', 'rejected')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+        review_notes TEXT,
+        reviewed_by TEXT,
+        content_revision TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (production_id) REFERENCES productions(id)
+      )`,
       `CREATE TABLE IF NOT EXISTS content_provenance (
         production_id TEXT PRIMARY KEY,
         sources TEXT NOT NULL DEFAULT '[]',
@@ -629,6 +651,16 @@ class Database {
       await this.executeQuery(tableQuery);
     }
 
+    await this.ensureColumns('content_approvals', { approved_revision: 'TEXT' });
+    await this.ensureColumns('content_approval_events', { content_revision: 'TEXT' });
+
+    // Legacy review_status mixed quality state and automatic approval; require a fresh explicit decision.
+    await this.executeQuery(
+      `INSERT OR IGNORE INTO content_approvals (production_id, status, review_notes, reviewed_at)
+       SELECT p.id, 'pending', NULL, NULL
+       FROM productions p`
+    );
+
     await this.ensureColumns('production_scenes', {
       narration_provider: 'TEXT',
       narration_model: 'TEXT',
@@ -650,10 +682,15 @@ class Database {
 
     // Insert default settings
     await this.insertDefaultSettings();
+    // Keep any legacy auto-publish setting inert even when upgrading an existing database.
+    await this.setSetting('auto_publish_enabled', 'false');
   }
 
   async ensureColumns(tableName, columns) {
-    const allowedTables = new Set(['production_scenes', 'channel_strategies', 'discoverability_audits']);
+    const allowedTables = new Set([
+      'production_scenes', 'channel_strategies', 'discoverability_audits',
+      'content_approvals', 'content_approval_events'
+    ]);
     if (!allowedTables.has(tableName)) throw new Error(`Unsupported migration table: ${tableName}`);
     const existing = new Set((await this.getAllRows(`PRAGMA table_info(${tableName})`)).map(column => column.name));
     for (const [columnName, definition] of Object.entries(columns)) {
@@ -666,7 +703,7 @@ class Database {
   async insertDefaultSettings() {
     const defaultSettings = [
       ['daily_content_enabled', 'true', 'Enable daily content generation'],
-      ['auto_publish_enabled', 'true', 'Enable automatic publishing'],
+      ['auto_publish_enabled', 'false', 'Automatic publishing is disabled; publishing requires explicit approval'],
       ['analytics_enabled', 'true', 'Enable analytics collection'],
       ['optimization_enabled', 'true', 'Enable automatic optimization'],
       ['publish_time_optimization', 'true', 'Optimize publishing times automatically'],
@@ -826,7 +863,7 @@ class Database {
         production.estimatedDuration
       ]
     );
-  
+    await this.invalidateContentApproval(production.id, 'Production data changed; approval is required again');
     return production.id;
   }
 
@@ -845,6 +882,7 @@ class Database {
         production.id
       ]
     );
+    await this.invalidateContentApproval(production.id, 'Production data changed; approval is required again');
   }
 
   async getProductionPipeline() {
@@ -871,6 +909,7 @@ class Database {
         JSON.stringify(production.seo || {})
       ]
     );
+    await this.invalidateContentApproval(production.id, 'Publishing metadata changed; approval is required again');
   }
 
   async updateProductionStatus(productionId, status) {
@@ -894,12 +933,13 @@ class Database {
       'SELECT * FROM publish_schedule WHERE production_id = ? ORDER BY created_at DESC LIMIT 1',
       [productionId]
     );
+    const approval = await this.getContentApproval(productionId);
     const provenance = await this.getContentProvenance(productionId);
     const discoverability = await this.getLatestDiscoverabilityAudit(productionId, 'youtube');
     const scenes = await this.listProductionScenes(productionId);
     const sceneRevisions = scenes.length ? await this.listProductionSceneRevisions(productionId, 50) : [];
     const shorts = await this.listShortClips(productionId);
-    return {
+    const bundle = {
       ...row,
       assets: JSON.parse(row.assets || '{}'),
       timeline: JSON.parse(row.timeline || '{}'),
@@ -910,6 +950,9 @@ class Database {
       editorData: JSON.parse(row.editor_data || '{}'),
       qualityChecks: JSON.parse(row.quality_checks || '[]'),
       schedule: schedule ? { ...schedule, metadata: JSON.parse(schedule.metadata || '{}') } : null,
+      approval: approval || {
+        productionId, status: 'pending', reviewNotes: null, reviewedBy: null, reviewedAt: null
+      },
       provenance: provenance || {
         sources: [], claims: [], containsSyntheticMedia: false, status: 'not_required',
         summary: { sourceCount: 0, verifiedSources: 0, claimCount: 0, resolvedClaims: 0, highRiskClaims: 0, unresolvedClaims: 0 }
@@ -919,6 +962,8 @@ class Database {
       sceneRevisions,
       shorts
     };
+    bundle.contentRevision = await this.getContentRevision(productionId);
+    return bundle;
   }
 
   async getPipelineOverview(limit = 50) {
@@ -927,11 +972,13 @@ class Database {
               p.priority, p.estimated_duration, p.created_at,
               ps.strategy, ps.script, ps.seo,
               cr.status AS review_status, cr.quality_checks,
+              COALESCE(ca.status, 'pending') AS approval_status,
               sch.id AS schedule_id, sch.status AS schedule_status,
               sch.publish_time, sch.youtube_url, sch.error_message
        FROM productions p
        LEFT JOIN production_snapshots ps ON ps.production_id = p.id
        LEFT JOIN content_reviews cr ON cr.production_id = p.id
+       LEFT JOIN content_approvals ca ON ca.production_id = p.id
        LEFT JOIN publish_schedule sch ON sch.id = (
          SELECT id FROM publish_schedule WHERE production_id = p.id ORDER BY created_at DESC LIMIT 1
        )
@@ -1149,6 +1196,7 @@ class Database {
         ]
       );
     }
+    await this.invalidateContentApproval(productionId, 'Production scenes changed; approval is required again');
     return this.listProductionScenes(productionId);
   }
 
@@ -1195,6 +1243,7 @@ class Database {
         productionId, sceneId
       ]
     );
+    await this.invalidateContentApproval(productionId, 'Production scene changed; approval is required again');
     return this.getProductionScene(productionId, sceneId);
   }
 
@@ -1214,6 +1263,7 @@ class Database {
         [position, sceneId]
       );
     }
+    await this.invalidateContentApproval(productionId, 'Production scene order changed; approval is required again');
     return this.listProductionScenes(productionId);
   }
 
@@ -1397,7 +1447,247 @@ class Database {
         review.reviewedAt || null
       ]
     );
+    await this.invalidateContentApproval(productionId, 'Review metadata changed; approval is required again');
     return this.getProductionBundle(productionId);
+  }
+
+  async getContentApproval(productionId) {
+    const row = await this.getRow(
+      'SELECT * FROM content_approvals WHERE production_id = ?', [productionId]
+    );
+    if (!row) return null;
+    const contentRevision = await this.getContentRevision(productionId);
+    const approvedRevision = row.approved_revision || null;
+    const current = row.status === 'approved' && approvedRevision === contentRevision;
+    return {
+      productionId: row.production_id,
+      status: row.status === 'approved' && !current ? 'pending' : row.status,
+      reviewNotes: row.review_notes,
+      reviewedBy: row.reviewed_by,
+      reviewedAt: row.reviewed_at,
+      updatedAt: row.updated_at,
+      approvedRevision,
+      contentRevision
+    };
+  }
+
+  async getContentRevision(productionId, connection = this.db) {
+    const production = await this.getRowFrom(connection,
+      `SELECT p.assets, p.timeline, p.scheduled_publish_time, p.priority, p.estimated_duration,
+              ps.strategy, ps.script, ps.thumbnail, ps.seo,
+              cr.status AS review_status, cr.editor_data, cr.quality_checks,
+              cp.sources, cp.claims, cp.contains_synthetic_media, cp.status AS provenance_status,
+              cp.summary AS provenance_summary
+       FROM productions p
+       LEFT JOIN production_snapshots ps ON ps.production_id = p.id
+       LEFT JOIN content_reviews cr ON cr.production_id = p.id
+       LEFT JOIN content_provenance cp ON cp.production_id = p.id
+       WHERE p.id = ?`, [productionId]);
+    if (!production) return null;
+    const scenes = await this.getAllRowsFrom(connection,
+      'SELECT * FROM production_scenes WHERE production_id = ? ORDER BY position, id', [productionId]);
+    const schedule = await this.getRowFrom(connection,
+      `SELECT title, publish_time, priority, metadata FROM publish_schedule
+       WHERE production_id = ? ORDER BY created_at DESC LIMIT 1`, [productionId]);
+    const audit = await this.getRowFrom(connection,
+      `SELECT id, platform, mode, engine, engine_version, schema_version, status, summary, error_code, error
+       FROM discoverability_audits WHERE production_id = ? AND platform = 'youtube'
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`, [productionId]);
+    const findings = audit ? await this.getAllRowsFrom(connection,
+      `SELECT rule_id, category, severity, applicability, message, remediation, fingerprint, review_status, review_reason
+       FROM discoverability_findings WHERE audit_id = ? ORDER BY rowid`, [audit.id]) : [];
+    const material = { production, scenes, schedule, audit, findings };
+    return crypto.createHash('sha256').update(this.stableStringify(material)).digest('hex');
+  }
+
+  stableStringify(value) {
+    if (Array.isArray(value)) return `[${value.map(item => this.stableStringify(item)).join(',')}]`;
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${this.stableStringify(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  getRowFrom(connection, query, params = []) {
+    return new Promise((resolve, reject) => connection.get(query, params, (error, row) => error ? reject(error) : resolve(row)));
+  }
+
+  getAllRowsFrom(connection, query, params = []) {
+    return new Promise((resolve, reject) => connection.all(query, params, (error, rows) => error ? reject(error) : resolve(rows || [])));
+  }
+
+  executeOn(connection, query, params = []) {
+    return new Promise((resolve, reject) => connection.run(query, params, function(error) {
+      if (error) reject(error);
+      else resolve({ lastID: this.lastID, changes: this.changes });
+    }));
+  }
+
+  async setContentApproval(productionId, decision = {}) {
+    const validStatuses = new Set(['pending', 'approved', 'rejected']);
+    if (!validStatuses.has(decision.status)) {
+      const error = new Error('Approval status must be pending, approved, or rejected');
+      error.status = 400;
+      error.code = 'INVALID_APPROVAL_STATUS';
+      throw error;
+    }
+
+    const status = decision.status;
+    if (status === 'approved') {
+      const error = new Error('Approval must be committed with its reviewed schedule through approveContentAndSchedule');
+      error.status = 409;
+      error.code = 'APPROVAL_TRANSACTION_REQUIRED';
+      throw error;
+    }
+    const reviewNotes = String(decision.reviewNotes || '').trim() || null;
+    const reviewedBy = String(decision.reviewedBy || 'local-operator').trim() || 'local-operator';
+    const reviewedAt = status === 'pending' ? null : new Date().toISOString();
+    const contentRevision = await this.getContentRevision(productionId);
+    await this.executeQuery('BEGIN TRANSACTION');
+    try {
+      const existing = await this.getRow(
+        'SELECT status FROM content_approvals WHERE production_id = ?', [productionId]
+      );
+      if (!existing) {
+        await this.executeQuery(
+          `INSERT INTO content_approvals (production_id, status, review_notes, reviewed_by, reviewed_at)
+           VALUES (?, 'pending', NULL, NULL, NULL)`, [productionId]
+        );
+      }
+
+      const previousStatus = existing?.status || 'pending';
+      await this.executeQuery(
+        `UPDATE content_approvals SET status = ?, review_notes = ?, reviewed_by = ?,
+         reviewed_at = ?, approved_revision = ?, updated_at = datetime('now') WHERE production_id = ?`,
+        [status, reviewNotes, status === 'pending' ? null : reviewedBy, reviewedAt,
+          null, productionId]
+      );
+      await this.executeQuery(
+        `INSERT INTO content_approval_events (
+          id, production_id, previous_status, status, review_notes, reviewed_by, content_revision, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+        [this.generateId('approval_event'), productionId, previousStatus, status, reviewNotes,
+          status === 'pending' ? null : reviewedBy, contentRevision]
+      );
+      await this.executeQuery('COMMIT');
+    } catch (error) {
+      await this.executeQuery('ROLLBACK');
+      throw error;
+    }
+
+    return this.getContentApproval(productionId);
+  }
+
+  async invalidateContentApproval(productionId, reviewNotes = 'Content changed; approval is required again') {
+    if (!productionId) return null;
+    const current = await this.getRow(
+      'SELECT status FROM content_approvals WHERE production_id = ?', [productionId]
+    );
+    if (!current || current.status === 'pending') return null;
+    return this.setContentApproval(productionId, {
+      status: 'pending', reviewNotes, reviewedBy: 'local-operator'
+    });
+  }
+
+  async approveContentAndSchedule(input = {}) {
+    const { productionId, expectedRevision, review = {}, scheduleEntry, decision = {} } = input;
+    if (!productionId || !expectedRevision || !scheduleEntry) {
+      const error = new Error('Approval requires a reviewed revision and complete schedule entry');
+      error.status = 400;
+      error.code = 'INVALID_APPROVAL_REQUEST';
+      throw error;
+    }
+
+    const connection = new sqlite3.Database(this.dbPath);
+    connection.configure('busyTimeout', 5000);
+    let transactionStarted = false;
+    try {
+      await this.executeOn(connection, 'BEGIN IMMEDIATE TRANSACTION');
+      transactionStarted = true;
+      const actualRevision = await this.getContentRevision(productionId, connection);
+      if (!actualRevision || actualRevision !== expectedRevision) {
+        const error = new Error('The content changed while approval was being reviewed; reload and review the current revision');
+        error.status = 409;
+        error.code = 'STALE_CONTENT_REVISION';
+        throw error;
+      }
+
+      await this.executeOn(connection,
+        `INSERT INTO content_reviews (
+          production_id, status, editor_data, quality_checks, review_notes, reviewed_at, updated_at
+        ) VALUES (?, 'approved', ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(production_id) DO UPDATE SET
+          status = 'approved', editor_data = excluded.editor_data,
+          quality_checks = excluded.quality_checks, review_notes = excluded.review_notes,
+          reviewed_at = excluded.reviewed_at, updated_at = datetime('now')`,
+        [productionId, JSON.stringify(review.editorData || {}), JSON.stringify(review.qualityChecks || []),
+          review.reviewNotes || null, review.reviewedAt || new Date().toISOString()]);
+
+      if (scheduleEntry.id) {
+        await this.executeOn(connection,
+          `UPDATE publish_schedule SET title = ?, publish_time = ?, status = 'scheduled',
+           priority = ?, metadata = ?, error_message = NULL WHERE id = ? AND production_id = ?`,
+          [scheduleEntry.title, scheduleEntry.publishTime, scheduleEntry.priority,
+            JSON.stringify(scheduleEntry.metadata || {}), scheduleEntry.id, productionId]);
+        const existing = await this.getRowFrom(connection,
+          'SELECT id FROM publish_schedule WHERE id = ? AND production_id = ?', [scheduleEntry.id, productionId]);
+        if (!existing) throw new Error('The schedule entry changed during approval');
+      } else {
+        scheduleEntry.id = this.generateId('schedule');
+        await this.executeOn(connection,
+          `INSERT INTO publish_schedule (id, production_id, title, publish_time, status, priority, metadata)
+           VALUES (?, ?, ?, ?, 'scheduled', ?, ?)`,
+          [scheduleEntry.id, productionId, scheduleEntry.title, scheduleEntry.publishTime,
+            scheduleEntry.priority, JSON.stringify(scheduleEntry.metadata || {})]);
+      }
+      scheduleEntry.status = 'scheduled';
+      await this.executeOn(connection, "UPDATE productions SET status = 'scheduled' WHERE id = ?", [productionId]);
+
+      const currentRevision = await this.getContentRevision(productionId, connection);
+      const currentApproval = await this.getRowFrom(connection,
+        'SELECT status FROM content_approvals WHERE production_id = ?', [productionId]);
+      const previousStatus = currentApproval?.status || 'pending';
+      await this.executeOn(connection,
+        `INSERT OR IGNORE INTO content_approvals (production_id, status) VALUES (?, 'pending')`, [productionId]);
+      const reviewNotes = String(decision.reviewNotes || 'Approved by operator').trim();
+      const reviewedBy = String(decision.reviewedBy || 'local-operator').trim();
+      const reviewedAt = new Date().toISOString();
+      await this.executeOn(connection,
+        `UPDATE content_approvals SET status = 'approved', review_notes = ?, reviewed_by = ?,
+         reviewed_at = ?, approved_revision = ?, updated_at = datetime('now') WHERE production_id = ?`,
+        [reviewNotes, reviewedBy, reviewedAt, currentRevision, productionId]);
+      await this.executeOn(connection,
+        `INSERT INTO content_approval_events (
+          id, production_id, previous_status, status, review_notes, reviewed_by, content_revision, created_at
+        ) VALUES (?, ?, ?, 'approved', ?, ?, ?, datetime('now'))`,
+        [this.generateId('approval_event'), productionId, previousStatus, reviewNotes, reviewedBy, currentRevision]);
+
+      await this.executeOn(connection, 'COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) await this.executeOn(connection, 'ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      await new Promise(resolve => connection.close(() => resolve()));
+    }
+    return { approval: await this.getContentApproval(productionId), scheduleEntry };
+  }
+
+  async getContentApprovalHistory(productionId) {
+    const rows = await this.getAllRows(
+      'SELECT * FROM content_approval_events WHERE production_id = ? ORDER BY created_at ASC, rowid ASC',
+      [productionId]
+    );
+    return rows.map(row => ({
+      id: row.id,
+      productionId: row.production_id,
+      previousStatus: row.previous_status,
+      status: row.status,
+      reviewNotes: row.review_notes,
+      reviewedBy: row.reviewed_by,
+      contentRevision: row.content_revision || null,
+      createdAt: row.created_at
+    }));
   }
 
   async saveContentProvenance(productionId, provenance = {}) {
@@ -1420,6 +1710,7 @@ class Database {
         provenance.reviewedAt || null
       ]
     );
+    await this.invalidateContentApproval(productionId, 'Content provenance changed; approval is required again');
     return this.getContentProvenance(productionId);
   }
 
@@ -1488,6 +1779,7 @@ class Database {
       await this.executeQuery('ROLLBACK');
       throw error;
     }
+    await this.invalidateContentApproval(productionId, 'Discoverability findings changed; approval is required again');
     return this.getDiscoverabilityAudit(auditId);
   }
 
@@ -1554,11 +1846,13 @@ class Database {
   }
 
   async reviewDiscoverabilityFinding(findingId, status, reason) {
+    const finding = await this.getDiscoverabilityFinding(findingId);
     await this.executeQuery(
       `UPDATE discoverability_findings SET review_status = ?, review_reason = ?, reviewed_at = datetime('now')
        WHERE id = ?`,
       [status, reason || null, findingId]
     );
+    await this.invalidateContentApproval(finding?.production_id, 'Discoverability review changed; approval is required again');
     return this.getDiscoverabilityFinding(findingId);
   }
 
@@ -1765,54 +2059,239 @@ class Database {
 
   // Publishing methods
   async saveScheduleEntry(entry) {
-    const existing = await this.getLatestScheduleEntry(entry.productionId);
-    if (existing) return existing;
-    const id = this.generateId('schedule');
-    entry.id = id;
-    
-    await this.executeQuery(
-      `INSERT INTO publish_schedule (
-        id, production_id, title, publish_time, status, 
-        priority, metadata
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        entry.productionId,
-        entry.title,
-        entry.publishTime,
-        entry.status,
-        entry.priority,
-        JSON.stringify(entry.metadata)
-      ]
-    );
-    
+    const approval = await this.getContentApproval(entry.productionId);
+    if (approval?.status !== 'approved') {
+      const error = new Error('Schedule creation requires current explicit approval');
+      error.status = 409;
+      error.code = 'CONTENT_NOT_APPROVED';
+      throw error;
+    }
+    return this.saveScheduleEntryWithApproval(entry, approval.contentRevision);
+  }
+
+  async saveScheduleEntryWithApproval(entry, expectedRevision, shortAuthorization = null) {
+    const connection = new sqlite3.Database(this.dbPath);
+    connection.configure('busyTimeout', 5000);
+    let transactionStarted = false;
+    try {
+      await this.executeOn(connection, 'BEGIN IMMEDIATE TRANSACTION');
+      transactionStarted = true;
+      const isShort = entry.metadata?.contentType === 'short';
+      const approvalId = isShort ? shortAuthorization?.sourceProductionId : entry.productionId;
+      const approval = approvalId ? await this.getRowFrom(connection,
+        'SELECT status, approved_revision FROM content_approvals WHERE production_id = ?', [approvalId]) : null;
+      const revision = approvalId ? await this.getContentRevision(approvalId, connection) : null;
+      if (approval?.status !== 'approved' || approval.approved_revision !== expectedRevision || revision !== expectedRevision) {
+        const error = new Error('Content changed after review; reload and approve the current revision before scheduling');
+        error.status = 409;
+        error.code = 'CONTENT_NOT_APPROVED';
+        throw error;
+      }
+      if (isShort) {
+        const clip = await this.getRowFrom(connection,
+          'SELECT status FROM shorts_clips WHERE id = ?', [shortAuthorization?.clipId]);
+        if (shortAuthorization?.confirmed !== true || !clip || clip.status !== 'rendered') {
+          const error = new Error('A rendered Short and explicit confirmation are required before scheduling');
+          error.status = 409;
+          error.code = 'SHORT_APPROVAL_REQUIRED';
+          throw error;
+        }
+      }
+
+      const existing = await this.getRowFrom(connection,
+        'SELECT * FROM publish_schedule WHERE production_id = ? ORDER BY created_at DESC LIMIT 1', [entry.productionId]);
+      if (existing) {
+        await this.executeOn(connection, 'COMMIT');
+        transactionStarted = false;
+        return this.deserializeScheduleEntry(existing);
+      }
+      entry.id = entry.id || this.generateId('schedule');
+      await this.executeOn(connection,
+        `INSERT INTO publish_schedule (id, production_id, title, publish_time, status, priority, metadata)
+         VALUES (?, ?, ?, ?, 'scheduled', ?, ?)`,
+        [entry.id, entry.productionId, entry.title, entry.publishTime, entry.priority,
+          JSON.stringify(entry.metadata || {})]);
+      await this.executeOn(connection, 'COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) await this.executeOn(connection, 'ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      await new Promise(resolve => connection.close(() => resolve()));
+    }
     return entry;
   }
 
   async updateScheduleEntry(entry) {
-    await this.executeQuery(
-      `UPDATE publish_schedule SET 
-        title = COALESCE(?, title), publish_time = COALESCE(?, publish_time),
-        status = ?, priority = COALESCE(?, priority), metadata = COALESCE(?, metadata),
-        youtube_id = ?, youtube_url = ?, published_at = ?, error_message = ?
-      WHERE id = ?`,
-      [
-        entry.title || null,
-        entry.publishTime || entry.publish_time || null,
-        entry.status,
-        entry.priority ?? null,
-        entry.metadata ? JSON.stringify(entry.metadata) : null,
-        entry.youtubeId || null,
-        entry.youtubeUrl || null,
-        entry.publishedAt || null,
-        entry.error || null,
-        entry.id
-      ]
-    );
+    const approvalId = entry.metadata?.contentType === 'short'
+      ? entry.metadata.sourceProductionId
+      : entry.productionId;
+    const approval = await this.getContentApproval(approvalId);
+    if (approval?.status !== 'approved') {
+      const error = new Error('Schedule changes require current explicit approval');
+      error.status = 409;
+      error.code = 'CONTENT_NOT_APPROVED';
+      throw error;
+    }
+    return this.updateScheduleEntryWithApproval(entry, approval.contentRevision);
+  }
+
+  async updateScheduleEntryWithApproval(entry, expectedRevision, options = {}) {
+    const connection = new sqlite3.Database(this.dbPath);
+    connection.configure('busyTimeout', 5000);
+    let transactionStarted = false;
+    try {
+      await this.executeOn(connection, 'BEGIN IMMEDIATE TRANSACTION');
+      transactionStarted = true;
+      const isShort = entry.metadata?.contentType === 'short';
+      const approvalId = isShort ? entry.metadata.sourceProductionId : entry.productionId;
+      const currentRevision = await this.getContentRevision(approvalId, connection);
+      const approval = await this.getRowFrom(connection,
+        'SELECT status, approved_revision FROM content_approvals WHERE production_id = ?', [approvalId]);
+      if (approval?.status !== 'approved' || approval.approved_revision !== expectedRevision || currentRevision !== expectedRevision) {
+        const error = new Error('The content approval is no longer current; reload and review before changing its schedule');
+        error.status = 409;
+        error.code = 'CONTENT_NOT_APPROVED';
+        throw error;
+      }
+      if (isShort) {
+        const clip = await this.getRowFrom(connection,
+          'SELECT status, approved_at, inherited_evidence FROM shorts_clips WHERE id = ?', [entry.metadata.shortClipId]);
+        let evidence = {};
+        try { evidence = JSON.parse(clip?.inherited_evidence || '{}'); } catch (_error) {}
+        if (!clip?.approved_at || !['scheduled', 'uploading', 'reconciliation_required', 'published'].includes(clip.status) ||
+          evidence.sourceContentRevision !== expectedRevision) {
+          const error = new Error('Short approval is no longer current');
+          error.status = 409;
+          error.code = 'CONTENT_NOT_APPROVED';
+          throw error;
+        }
+        if (options.invalidateApproval) {
+          const error = new Error('Changing a Short publish time requires a fresh explicit Short approval');
+          error.status = 409;
+          error.code = 'SHORT_APPROVAL_REQUIRED';
+          throw error;
+        }
+      }
+
+      await this.executeOn(connection,
+        `UPDATE publish_schedule SET
+          title = COALESCE(?, title), publish_time = COALESCE(?, publish_time), status = ?,
+          priority = COALESCE(?, priority), metadata = COALESCE(?, metadata),
+          youtube_id = ?, youtube_url = ?, published_at = ?, error_message = ?
+         WHERE id = ? AND production_id = ?`,
+        [entry.title || null, entry.publishTime || entry.publish_time || null, entry.status,
+          entry.priority ?? null, entry.metadata ? JSON.stringify(entry.metadata) : null,
+          entry.youtubeId || null, entry.youtubeUrl || null, entry.publishedAt || null,
+          entry.error || null, entry.id, entry.productionId]);
+      const persisted = await this.getRowFrom(connection,
+        'SELECT id FROM publish_schedule WHERE id = ? AND production_id = ?', [entry.id, entry.productionId]);
+      if (!persisted) throw new Error('The schedule entry no longer exists');
+
+      if (options.productionStatus && !isShort) {
+        await this.executeOn(connection, 'UPDATE productions SET status = ? WHERE id = ?', [options.productionStatus, entry.productionId]);
+      }
+      if (options.invalidateApproval) {
+        const updatedRevision = await this.getContentRevision(entry.productionId, connection);
+        await this.invalidateApprovalOn(connection, entry.productionId, updatedRevision, options.reviewNotes);
+      }
+
+      await this.executeOn(connection, 'COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) await this.executeOn(connection, 'ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      await new Promise(resolve => connection.close(() => resolve()));
+    }
+    return this.getLatestScheduleEntry(entry.productionId);
+  }
+
+  async deleteScheduleEntryWithApproval(entry, expectedRevision, options = {}) {
+    const connection = new sqlite3.Database(this.dbPath);
+    connection.configure('busyTimeout', 5000);
+    let transactionStarted = false;
+    try {
+      await this.executeOn(connection, 'BEGIN IMMEDIATE TRANSACTION');
+      transactionStarted = true;
+      const isShort = entry.metadata?.contentType === 'short';
+      const approvalId = isShort ? entry.metadata.sourceProductionId : entry.productionId;
+      const currentRevision = await this.getContentRevision(approvalId, connection);
+      const approval = await this.getRowFrom(connection,
+        'SELECT status, approved_revision FROM content_approvals WHERE production_id = ?', [approvalId]);
+      if (approval?.status !== 'approved' || approval.approved_revision !== expectedRevision || currentRevision !== expectedRevision) {
+        const error = new Error('The content approval is no longer current; reload and review before changing its schedule');
+        error.status = 409;
+        error.code = 'CONTENT_NOT_APPROVED';
+        throw error;
+      }
+      if (isShort) {
+        const clip = await this.getRowFrom(connection,
+          'SELECT status, approved_at, inherited_evidence FROM shorts_clips WHERE id = ?', [entry.metadata.shortClipId]);
+        let evidence = {};
+        try { evidence = JSON.parse(clip?.inherited_evidence || '{}'); } catch (_error) {}
+        if (!clip?.approved_at || !['scheduled', 'uploading', 'reconciliation_required', 'published'].includes(clip.status) ||
+          evidence.sourceContentRevision !== expectedRevision) {
+          const error = new Error('Short approval is no longer current');
+          error.status = 409;
+          error.code = 'CONTENT_NOT_APPROVED';
+          throw error;
+        }
+      }
+      await this.executeOn(connection,
+        'DELETE FROM publish_schedule WHERE id = ? AND production_id = ?', [entry.id, entry.productionId]);
+      if (isShort) {
+        await this.executeOn(connection,
+          `UPDATE shorts_clips SET status = 'rendered', approved_at = NULL, schedule_id = NULL,
+           updated_at = datetime('now') WHERE id = ?`, [entry.metadata.shortClipId]);
+      } else {
+        const updatedRevision = await this.getContentRevision(entry.productionId, connection);
+        if (options.productionStatus) {
+        await this.executeOn(connection, 'UPDATE productions SET status = ? WHERE id = ?', [options.productionStatus, entry.productionId]);
+        }
+        await this.invalidateApprovalOn(connection, entry.productionId, updatedRevision, options.reviewNotes);
+      }
+      await this.executeOn(connection, 'COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) await this.executeOn(connection, 'ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      await new Promise(resolve => connection.close(() => resolve()));
+    }
+  }
+
+  async invalidateApprovalOn(connection, productionId, contentRevision, reviewNotes) {
+    const current = await this.getRowFrom(connection,
+      'SELECT status FROM content_approvals WHERE production_id = ?', [productionId]);
+    if (!current || current.status === 'pending') return;
+    const notes = String(reviewNotes || 'Content or schedule changed; approval is required again');
+    await this.executeOn(connection,
+      `UPDATE content_approvals SET status = 'pending', review_notes = ?, reviewed_by = NULL,
+       reviewed_at = NULL, approved_revision = NULL, updated_at = datetime('now') WHERE production_id = ?`,
+      [notes, productionId]);
+    await this.executeOn(connection,
+      `INSERT INTO content_approval_events (
+        id, production_id, previous_status, status, review_notes, reviewed_by, content_revision, created_at
+       ) VALUES (?, ?, ?, 'pending', ?, NULL, ?, datetime('now'))`,
+      [this.generateId('approval_event'), productionId, current.status, notes, contentRevision]);
   }
 
   async deleteScheduleEntry(id) {
-    await this.executeQuery('DELETE FROM publish_schedule WHERE id = ?', [id]);
+    const entry = await this.getRow('SELECT * FROM publish_schedule WHERE id = ?', [id]);
+    if (!entry) return;
+    const scheduleEntry = this.deserializeScheduleEntry(entry);
+    const approvalId = scheduleEntry.metadata?.contentType === 'short'
+      ? scheduleEntry.metadata.sourceProductionId
+      : scheduleEntry.productionId;
+    const approval = await this.getContentApproval(approvalId);
+    if (approval?.status !== 'approved') {
+      const error = new Error('Schedule deletion requires current explicit approval');
+      error.status = 409;
+      error.code = 'CONTENT_NOT_APPROVED';
+      throw error;
+    }
+    return this.deleteScheduleEntryWithApproval(scheduleEntry, approval.contentRevision);
   }
 
   async getLatestScheduleEntry(productionId) {

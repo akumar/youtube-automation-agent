@@ -37,15 +37,6 @@ class DailyAutomation {
       }, { scheduled: false })
     );
 
-    // Publishing queue processing every 15 minutes
-    this.scheduledTasks.set('publish-queue-processing',
-      cron.schedule('*/15 * * * *', async () => {
-        if (this.isEnabled) {
-          await this.processPublishQueue();
-        }
-      }, { scheduled: false })
-    );
-
     // Analytics collection at 9:00 AM daily
     this.scheduledTasks.set('daily-analytics',
       cron.schedule('0 9 * * *', async () => {
@@ -155,13 +146,8 @@ class DailyAutomation {
       });
       this.logger.info(`Production completed: ${productionData.id}`);
 
-      // Schedule for publishing (returns null when only placeholder assets were produced)
-      const scheduleEntry = await this.agents.publishing.scheduleContent(productionData);
-      if (scheduleEntry) {
-        this.logger.info('Content scheduled for publishing');
-      } else {
-        this.logger.warn('Content was NOT scheduled — production produced placeholder assets. See warnings above.');
-      }
+      // Generation creates a draft only. An operator must approve it before scheduling.
+      this.logger.info('Draft generated; explicit operator review and approval are required before scheduling.');
 
       timer.end();
       this.logger.success('Daily content generation completed successfully');
@@ -170,7 +156,8 @@ class DailyAutomation {
       await this.logAutomationEvent('daily_content_generation', 'success', {
         contentId: productionData.id,
         topic: strategy.topic,
-        scheduledFor: productionData.scheduledPublishTime
+        scheduledFor: null,
+        reviewRequired: true
       });
 
     } catch (error) {

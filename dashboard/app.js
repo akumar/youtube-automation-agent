@@ -110,7 +110,9 @@ async function refreshDashboard(silent = false) {
 
 function renderDashboard() {
   const state = ui.state;
-  const reviews = state.pipeline.filter(item => ['needs_review', 'needs_attention'].includes(item.review_status));
+  const reviews = state.pipeline.filter(item =>
+    ['pending', 'rejected'].includes(item.approval_status) || ['needs_review', 'needs_attention'].includes(item.review_status)
+  );
   const scheduled = state.schedule.filter(item => item.status === 'scheduled');
   const actionableJobs = state.jobs.filter(job => ['queued', 'running', 'failed', 'interrupted'].includes(job.status));
 
@@ -255,7 +257,7 @@ function currentPipelineFilter() {
 function renderPipeline(items) {
   const filter = currentPipelineFilter();
   const filtered = filter === 'all' ? items : items.filter(item =>
-    item.review_status === filter || item.schedule_status === filter || item.status === filter
+    item.approval_status === filter || item.review_status === filter || item.schedule_status === filter || item.status === filter
   );
   const container = $('#pipeline-list');
   if (!filtered.length) {
@@ -263,7 +265,7 @@ function renderPipeline(items) {
     return;
   }
   container.innerHTML = filtered.map(item => {
-    const state = item.schedule_status || item.review_status || item.status;
+    const state = item.schedule_status || item.approval_status || item.review_status || item.status;
     const next = nextAction(item);
     return `<article class="pipeline-item" data-open-content="${escapeHTML(item.id)}">
       <div class="pipeline-title"><strong>${escapeHTML(item.title)}</strong><span>${escapeHTML(item.topic || 'No topic recorded')} · ${formatDate(item.created_at)}</span></div>
@@ -283,6 +285,8 @@ function nextAction(item) {
   if (item.schedule_status === 'published') return 'View';
   if (item.review_status === 'needs_attention') return 'Fix issues';
   if (item.review_status === 'needs_review') return 'Review';
+  if (item.approval_status === 'rejected') return 'Review changes';
+  if (item.approval_status === 'pending') return 'Review';
   if (item.schedule_status === 'scheduled') return 'Scheduled';
   return 'Inspect';
 }
@@ -990,6 +994,10 @@ async function openContent(productionId) {
   $('#loading').classList.add('active');
   try {
     const item = await api(`/api/content/${encodeURIComponent(productionId)}`);
+    const approvalHistoryResponse = await api(
+      `/api/content/${encodeURIComponent(productionId)}/approval-history`
+    ).catch(() => ({ result: { events: [] } }));
+    const approvalEvents = approvalHistoryResponse.result?.events || [];
     const data = item.editorData || {};
     const title = data.title || item.seo?.title || item.script?.title || item.strategy?.topic || 'Untitled content';
     const description = data.description || item.seo?.description || '';
@@ -1001,6 +1009,7 @@ async function openContent(productionId) {
     const selectedThumbnailVariant = Number(data.selectedThumbnailVariant || 0);
     $('#content-detail').innerHTML = `
       <div class="dialog-heading"><div><p class="eyebrow">CONTENT REVIEW</p><h2>${escapeHTML(title)}</h2><div class="meta-line">${statusChip(item.schedule?.status || item.review_status || item.status)} · Quality ${qualityScore(item.qualityChecks)}%</div></div><button type="button" class="close-button" data-close>×</button></div>
+      <section class="panel compact"><div class="panel-heading"><div><p class="eyebrow">MANUAL APPROVAL</p><h3>${statusChip(item.approval?.status || 'pending')}</h3></div></div>${approvalEvents.length ? approvalEvents.slice().reverse().map(event => `<p class="meta-line">${escapeHTML(label(event.previousStatus || 'initial'))} → ${escapeHTML(label(event.status))} · ${escapeHTML(event.reviewedBy || 'local operator')} · ${escapeHTML(formatDate(event.createdAt))}${event.reviewNotes ? `<br>${escapeHTML(event.reviewNotes)}` : ''}</p>`).join('') : '<p class="meta-line">No review decisions recorded yet.</p>'}</section>
       <form id="content-review-form" class="editor content-review-editor">
         <div class="content-layout">
           <div>

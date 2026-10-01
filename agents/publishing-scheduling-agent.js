@@ -5,6 +5,33 @@ const path = require('path');
 const { Logger } = require('../utils/logger');
 const { assertValidYouTubeMetadata } = require('../utils/youtube-metadata-validator');
 
+function buildYouTubeVideoMetadata(scheduleEntry, options, now, defaultPrivacyStatus) {
+  const { metadata } = scheduleEntry;
+  const validation = assertValidYouTubeMetadata(metadata.seo);
+  const safeMetadata = validation.value;
+  const requestedPrivacy = metadata.privacyStatus || defaultPrivacyStatus || 'private';
+  const scheduledFor = new Date(scheduleEntry.publishTime);
+  const futureSchedule = !options.publishNow && Number.isFinite(scheduledFor.getTime()) && scheduledFor.getTime() > now + 60000;
+  const videoMetadata = {
+    snippet: {
+      title: safeMetadata.title,
+      description: safeMetadata.description,
+      tags: safeMetadata.tags,
+      categoryId: safeMetadata.categoryId,
+      defaultLanguage: safeMetadata.defaultLanguage,
+      defaultAudioLanguage: safeMetadata.defaultAudioLanguage
+    },
+    status: {
+      privacyStatus: futureSchedule ? 'private' : requestedPrivacy,
+      selfDeclaredMadeForKids: false,
+      containsSyntheticMedia: metadata.containsSyntheticMedia === true
+    }
+  };
+  if (futureSchedule) videoMetadata.status.publishAt = scheduleEntry.publishTime;
+
+  return { validation, videoMetadata };
+}
+
 class PublishingSchedulingAgent {
   constructor(db, credentials) {
     this.db = db;
@@ -42,16 +69,22 @@ class PublishingSchedulingAgent {
     }
   }
 
-  async scheduleContent(productionData) {
+  async scheduleContent(productionData, approvalContext = null) {
     try {
-      const finalVideo = productionData.assets?.finalVideo;
-      if (!finalVideo || finalVideo.simulated || path.extname(finalVideo.path || '').toLowerCase() !== '.mp4') {
-        this.logger.warn(`Not scheduling ${productionData.id}: no real video file was produced (placeholder/simulated output). Fix your AI provider keys and FFmpeg, then regenerate.`);
-        return null;
+      const candidate = await this.prepareScheduleEntry(productionData);
+      if (!candidate) return null;
+
+      let approval = await this.db.getContentApproval?.(productionData.id);
+      if (productionData.contentType === 'short' && approvalContext?.type === 'short' && approvalContext.confirmed === true) {
+        const sourceApproval = await this.db.getContentApproval?.(approvalContext.sourceProductionId);
+        const short = await this.db.getShortClip?.(approvalContext.clipId);
+        approval = sourceApproval?.status === 'approved' && short?.status === 'rendered' ? sourceApproval : null;
       }
-      if (!await this.isNarrationReady(productionData.assets?.audio)) {
-        this.logger.warn(`Not scheduling ${productionData.id}: narration is missing. Regenerate narration or explicitly confirm an intentional silent video.`);
-        return null;
+      if (approval?.status !== 'approved') {
+        const error = new Error('Content cannot be scheduled until it has explicit operator approval');
+        error.status = 409;
+        error.code = 'CONTENT_NOT_APPROVED';
+        throw error;
       }
 
       this.logger.info(`Scheduling content: ${productionData.id}`);
@@ -65,37 +98,53 @@ class PublishingSchedulingAgent {
         return existing;
       }
 
-      const scheduleEntry = {
-        productionId: productionData.id,
-        title: productionData.script.title,
-        publishTime: productionData.scheduledPublishTime,
-        status: 'scheduled',
-        priority: productionData.priority,
-        metadata: {
-          seo: productionData.seo,
-          thumbnail: productionData.assets.thumbnail,
-          video: productionData.assets.finalVideo,
-          audio: productionData.assets.audio,
-          captions: productionData.assets.captions,
-          privacyStatus: productionData.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
-          containsSyntheticMedia: productionData.containsSyntheticMedia === true,
-          contentType: productionData.contentType || 'long_form',
-          sourceProductionId: productionData.sourceProductionId || productionData.id,
-          shortClipId: productionData.shortClipId || null
-        },
-        createdAt: new Date().toISOString()
-      };
-      
-      const saved = await this.db.saveScheduleEntry(scheduleEntry) || scheduleEntry;
+      const saved = this.db.saveScheduleEntryWithApproval
+        ? await this.db.saveScheduleEntryWithApproval(candidate, approval.contentRevision, {
+          ...approvalContext, confirmed: approvalContext?.confirmed === true
+        })
+        : await this.db.saveScheduleEntry(candidate) || candidate;
       this.publishQueue.push(saved);
       this.publishQueue.sort((a, b) => new Date(a.publishTime) - new Date(b.publishTime));
-      
       this.logger.info(`Content scheduled for: ${saved.publishTime}`);
       return saved;
     } catch (error) {
       this.logger.error('Failed to schedule content:', error);
       throw error;
     }
+  }
+
+  async prepareScheduleEntry(productionData, existing = {}) {
+    const finalVideo = productionData.assets?.finalVideo;
+    if (!finalVideo || finalVideo.simulated || path.extname(finalVideo.path || '').toLowerCase() !== '.mp4') {
+      this.logger.warn(`Not scheduling ${productionData.id}: no real video file was produced (placeholder/simulated output). Fix your AI provider keys and FFmpeg, then regenerate.`);
+      return null;
+    }
+    if (!await this.isNarrationReady(productionData.assets?.audio)) {
+      this.logger.warn(`Not scheduling ${productionData.id}: narration is missing. Regenerate narration or explicitly confirm an intentional silent video.`);
+      return null;
+    }
+    return {
+      ...existing,
+      productionId: productionData.id,
+      title: productionData.script.title,
+      publishTime: productionData.scheduledPublishTime,
+      status: 'scheduled',
+      priority: productionData.priority,
+      metadata: {
+        ...(existing.metadata || {}),
+        seo: productionData.seo,
+        thumbnail: productionData.assets.thumbnail,
+        video: productionData.assets.finalVideo,
+        audio: productionData.assets.audio,
+        captions: productionData.assets.captions,
+        privacyStatus: productionData.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
+        containsSyntheticMedia: productionData.containsSyntheticMedia === true,
+        contentType: productionData.contentType || 'long_form',
+        sourceProductionId: productionData.sourceProductionId || productionData.id,
+        shortClipId: productionData.shortClipId || null
+      },
+      createdAt: existing.createdAt || new Date().toISOString()
+    };
   }
 
   async publishContent(contentId, options = {}) {
@@ -134,6 +183,7 @@ class PublishingSchedulingAgent {
       if (!scheduleEntry) {
         throw new Error(`Content not found in queue: ${contentId}`);
       }
+      scheduleEntry = { ...scheduleEntry };
       if (scheduleEntry.status === 'published') return scheduleEntry;
       if (!await this.isNarrationReady(scheduleEntry.metadata?.audio || productionBundle?.assets?.audio)) {
         const error = new Error('Publishing is blocked because narration is missing or the intentional-silence override is incomplete');
@@ -141,8 +191,9 @@ class PublishingSchedulingAgent {
         error.code = 'NARRATION_REQUIRED';
         throw error;
       }
+      const approval = await this.requireCurrentApproval(scheduleEntry);
       if (scheduleEntry.youtubeId) {
-        return this.reconcileUploadedVideo(scheduleEntry);
+        return this.reconcileUploadedVideo(scheduleEntry, approval.contentRevision);
       }
       if (['uploading', 'reconciliation_required'].includes(scheduleEntry.status)) {
         const error = new Error('A previous upload may have reached YouTube without returning a video ID. Reconcile the channel before attempting another upload.');
@@ -153,7 +204,7 @@ class PublishingSchedulingAgent {
 
       scheduleEntry.status = 'uploading';
       scheduleEntry.error = null;
-      await this.db.updateScheduleEntry(scheduleEntry);
+      await this.persistApprovedScheduleEntry(scheduleEntry, approval.contentRevision);
       await this.syncShortStatus(scheduleEntry, 'uploading');
       
       let uploadResult;
@@ -163,14 +214,14 @@ class PublishingSchedulingAgent {
         if (scheduleEntry.uploadAttempted && this.isUploadOutcomeUnknown(error)) {
           scheduleEntry.status = 'reconciliation_required';
           scheduleEntry.error = 'Upload outcome is unknown; verify the YouTube channel before retrying';
-          await this.db.updateScheduleEntry(scheduleEntry);
+          await this.persistApprovedScheduleEntry(scheduleEntry, approval.contentRevision);
           await this.syncShortStatus(scheduleEntry, 'reconciliation_required', scheduleEntry.error);
           error.code = 'UPLOAD_OUTCOME_UNKNOWN';
           error.status = 409;
         } else {
           scheduleEntry.status = 'failed';
           scheduleEntry.error = error.message;
-          await this.db.updateScheduleEntry(scheduleEntry);
+          await this.persistApprovedScheduleEntry(scheduleEntry, approval.contentRevision);
           await this.syncShortStatus(scheduleEntry, 'failed', error.message);
         }
         throw error;
@@ -182,7 +233,7 @@ class PublishingSchedulingAgent {
       scheduleEntry.youtubeId = uploadResult.id;
       scheduleEntry.youtubeUrl = `https://www.youtube.com/watch?v=${uploadResult.id}`;
       
-      await this.db.updateScheduleEntry(scheduleEntry);
+      await this.persistApprovedScheduleEntry(scheduleEntry, approval.contentRevision, { productionStatus: 'published' });
       await this.syncShortStatus(scheduleEntry, 'published');
       
       // Remove from queue
@@ -197,33 +248,19 @@ class PublishingSchedulingAgent {
   }
 
   async uploadToYouTube(scheduleEntry, options = {}) {
-    const { metadata } = scheduleEntry;
-    const validation = assertValidYouTubeMetadata(metadata.seo);
+    // Draft-only mode: block every YouTube upload, including direct calls.
+    const error = new Error('YouTube uploads are disabled. Review and approve the video first.');
+    error.status = 403;
+    error.code = 'YOUTUBE_UPLOAD_DISABLED';
+    throw error;
+
+    const { validation, videoMetadata } = buildYouTubeVideoMetadata(
+      scheduleEntry, options, Date.now(), process.env.DEFAULT_PRIVACY_STATUS
+    );
     if (validation.warnings.length) {
       this.logger.warn(`YouTube metadata warnings: ${validation.warnings.join(' ')}`);
     }
-    const safeMetadata = validation.value;
-    
-    // Prepare video metadata
-    const requestedPrivacy = metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private';
-    const scheduledFor = new Date(scheduleEntry.publishTime);
-    const futureSchedule = !options.publishNow && Number.isFinite(scheduledFor.getTime()) && scheduledFor.getTime() > Date.now() + 60000;
-    const videoMetadata = {
-      snippet: {
-        title: safeMetadata.title,
-        description: safeMetadata.description,
-        tags: safeMetadata.tags,
-        categoryId: safeMetadata.categoryId,
-        defaultLanguage: safeMetadata.defaultLanguage,
-        defaultAudioLanguage: safeMetadata.defaultAudioLanguage
-      },
-      status: {
-        privacyStatus: futureSchedule ? 'private' : requestedPrivacy,
-        selfDeclaredMadeForKids: false,
-        containsSyntheticMedia: metadata.containsSyntheticMedia === true
-      }
-    };
-    if (futureSchedule) videoMetadata.status.publishAt = scheduleEntry.publishTime;
+    const { metadata } = scheduleEntry;
     
     // Resolve the file before marking the network upload as attempted.
     const videoStream = await this.getVideoStream(metadata.video.path);
@@ -275,12 +312,12 @@ class PublishingSchedulingAgent {
     return !status || status >= 500;
   }
 
-  async reconcileUploadedVideo(scheduleEntry) {
+  async reconcileUploadedVideo(scheduleEntry, expectedRevision) {
     const response = await this.youtube.videos.list({ part: 'id,status', id: scheduleEntry.youtubeId });
     if (!response.data.items?.some(video => video.id === scheduleEntry.youtubeId)) {
       scheduleEntry.status = 'reconciliation_required';
       scheduleEntry.error = 'The recorded YouTube video ID could not be verified';
-      await this.db.updateScheduleEntry(scheduleEntry);
+      await this.persistApprovedScheduleEntry(scheduleEntry, expectedRevision);
       await this.syncShortStatus(scheduleEntry, 'reconciliation_required', scheduleEntry.error);
       const error = new Error('The recorded upload could not be verified on YouTube. Resolve it before attempting another upload.');
       error.status = 409;
@@ -291,7 +328,7 @@ class PublishingSchedulingAgent {
     scheduleEntry.publishedAt = scheduleEntry.publishedAt || new Date().toISOString();
     scheduleEntry.youtubeUrl = scheduleEntry.youtubeUrl || `https://www.youtube.com/watch?v=${scheduleEntry.youtubeId}`;
     scheduleEntry.error = null;
-    await this.db.updateScheduleEntry(scheduleEntry);
+    await this.persistApprovedScheduleEntry(scheduleEntry, expectedRevision, { productionStatus: 'published' });
     await this.syncShortStatus(scheduleEntry, 'published');
     this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
     this.logger.success(`Reconciled existing YouTube upload: ${scheduleEntry.youtubeUrl}`);
@@ -323,6 +360,11 @@ class PublishingSchedulingAgent {
     }
   }
   async uploadThumbnail(videoId, thumbnailPath) {
+    const error = new Error('YouTube uploads and metadata updates are disabled in draft-only mode');
+    error.status = 403;
+    error.code = 'YOUTUBE_UPLOAD_DISABLED';
+    throw error;
+
     try {
       const thumbnailBuffer = await fs.readFile(thumbnailPath);
       
@@ -340,6 +382,11 @@ class PublishingSchedulingAgent {
   }
 
   async applyVideoPackaging(videoId, packaging = {}, previousPackaging = null) {
+    const error = new Error('YouTube uploads and metadata updates are disabled in draft-only mode');
+    error.status = 403;
+    error.code = 'YOUTUBE_UPLOAD_DISABLED';
+    throw error;
+
     const title = String(packaging.title || '').trim();
     if (!videoId || !title || title.length > 100 || !packaging.thumbnailPath) {
       const error = new Error('A valid video ID, title, and thumbnail are required for a packaging change');
@@ -391,6 +438,11 @@ class PublishingSchedulingAgent {
   }
 
   async uploadCaptions(videoId, captionsPath) {
+    const error = new Error('YouTube uploads and metadata updates are disabled in draft-only mode');
+    error.status = 403;
+    error.code = 'YOUTUBE_UPLOAD_DISABLED';
+    throw error;
+
     try {
       const captionsContent = await fs.readFile(captionsPath, 'utf8');
       
@@ -435,19 +487,28 @@ class PublishingSchedulingAgent {
 
     for (const entry of readyToPublish) {
       try {
+        if (!await this.isEntryApproved(entry)) {
+          this.logger.warn(`Skipping ${entry.title}: explicit approval is required`);
+          continue;
+        }
         await this.publishContent(entry.productionId);
         this.logger.info(`Auto-published: ${entry.title}`);
       } catch (error) {
-        if (error.code === 'READINESS_BLOCKED') {
+        if (error.code === 'READINESS_BLOCKED' || error.code === 'CONTENT_NOT_APPROVED') {
           this.logger.warn(error.message);
           continue;
         }
         this.logger.error(`Failed to auto-publish ${entry.title}:`, error);
         // Mark as failed but don't stop processing other items
         if (error.code !== 'UPLOAD_OUTCOME_UNKNOWN') {
-          entry.status = 'failed';
-          entry.error = error.message;
-          await this.db.updateScheduleEntry(entry);
+          try {
+            const approval = await this.requireCurrentApproval(entry);
+            const failedEntry = { ...entry, status: 'failed', error: error.message };
+            await this.persistApprovedScheduleEntry(failedEntry, approval.contentRevision);
+          } catch (approvalError) {
+            if (approvalError.code !== 'CONTENT_NOT_APPROVED') throw approvalError;
+            this.logger.warn(`Leaving ${entry.title} unchanged because approval is no longer current`);
+          }
         }
       }
     }
@@ -479,9 +540,16 @@ class PublishingSchedulingAgent {
         const betterTime = this.findBetterTime(currentTime, optimalTimes);
         
         if (betterTime && betterTime.getTime() !== currentTime.getTime()) {
-          entry.publishTime = betterTime.toISOString();
-          await this.db.updateScheduleEntry(entry);
-          this.logger.info(`Optimized publish time for: ${entry.title}`);
+          try {
+            const approval = await this.requireCurrentApproval(entry);
+            const updated = { ...entry, publishTime: betterTime.toISOString() };
+            await this.persistApprovedScheduleEntry(updated, approval.contentRevision, {
+              invalidateApproval: true, productionStatus: 'scheduled'
+            });
+            this.logger.info(`Optimized publish time for: ${entry.title}; fresh approval is required`);
+          } catch (error) {
+            if (error.code !== 'CONTENT_NOT_APPROVED') throw error;
+          }
         }
       }
     }
@@ -636,11 +704,14 @@ class PublishingSchedulingAgent {
       const entry = this.publishQueue.find(e => e.productionId === contentId || e.id === contentId) ||
         await this.db.getLatestScheduleEntry?.(contentId);
       if (!entry) throw new Error(`Content not found: ${contentId}`);
+      const approval = await this.requireCurrentApproval(entry);
       const newPublishTime = new Date(Date.now() + (delayMinutes * 60 * 1000));
-      entry.publishTime = newPublishTime.toISOString();
-      await this.db.updateScheduleEntry(entry);
-      this.logger.info(`Emergency scheduled for: ${entry.publishTime}`);
-      return entry;
+      const updated = { ...entry, publishTime: newPublishTime.toISOString() };
+      await this.persistApprovedScheduleEntry(updated, approval.contentRevision, {
+        invalidateApproval: true, productionStatus: 'scheduled'
+      });
+      this.logger.info(`Emergency scheduled for: ${updated.publishTime}`);
+      return updated;
     }
     return this.publishContent(contentId, { publishNow: true });
   }
@@ -653,12 +724,13 @@ class PublishingSchedulingAgent {
     if (!entry) {
       throw new Error(`Content not found: ${contentId}`);
     }
+
+    const approval = await this.requireCurrentApproval(entry);
+    const updated = { ...entry, status: 'paused' };
+    await this.persistApprovedScheduleEntry(updated, approval.contentRevision);
     
-    entry.status = 'paused';
-    await this.db.updateScheduleEntry(entry);
-    
-    this.logger.info(`Content paused: ${entry.title}`);
-    return entry;
+    this.logger.info(`Content paused: ${updated.title}`);
+    return updated;
   }
 
   async resumeScheduledContent(contentId, newPublishTime = null) {
@@ -669,16 +741,20 @@ class PublishingSchedulingAgent {
     if (!entry) {
       throw new Error(`Content not found: ${contentId}`);
     }
-    
-    entry.status = 'scheduled';
+
+    const approval = await this.requireCurrentApproval(entry);
+    const updated = { ...entry, status: 'scheduled' };
     if (newPublishTime) {
-      entry.publishTime = new Date(newPublishTime).toISOString();
+      updated.publishTime = new Date(newPublishTime).toISOString();
     }
     
-    await this.db.updateScheduleEntry(entry);
+    await this.persistApprovedScheduleEntry(updated, approval.contentRevision, {
+      invalidateApproval: Boolean(newPublishTime),
+      productionStatus: 'scheduled'
+    });
     
-    this.logger.info(`Content resumed: ${entry.title}`);
-    return entry;
+    this.logger.info(`Content resumed: ${updated.title}`);
+    return updated;
   }
 
   async rescheduleContent(contentId, newPublishTime) {
@@ -695,18 +771,19 @@ class PublishingSchedulingAgent {
       error.status = 404;
       throw error;
     }
+    const approval = await this.requireCurrentApproval(entry);
     if (['uploading', 'uploaded', 'published', 'reconciliation_required'].includes(entry.status)) {
       const error = new Error(`Content cannot be rescheduled while it is ${entry.status}`);
       error.status = 409;
       throw error;
     }
-    entry.publishTime = publishTime.toISOString();
-    entry.status = 'scheduled';
-    entry.error = null;
-    await this.db.updateScheduleEntry(entry);
-    if (!this.publishQueue.some(item => item.id === entry.id)) this.publishQueue.push(entry);
+    const updated = { ...entry, publishTime: publishTime.toISOString(), status: 'scheduled', error: null };
+    await this.persistApprovedScheduleEntry(updated, approval.contentRevision, {
+      invalidateApproval: true, productionStatus: 'scheduled'
+    });
+    if (!this.publishQueue.some(item => item.id === updated.id)) this.publishQueue.push(updated);
     this.publishQueue.sort((a, b) => new Date(a.publishTime) - new Date(b.publishTime));
-    return entry;
+    return updated;
   }
 
   async deleteScheduledContent(contentId) {
@@ -717,16 +794,74 @@ class PublishingSchedulingAgent {
       error.status = 404;
       throw error;
     }
+    const approval = await this.requireCurrentApproval(entry);
     if (['uploading', 'uploaded', 'published', 'reconciliation_required'].includes(entry.status)) {
       const error = new Error(`The schedule cannot be deleted while content is ${entry.status}`);
       error.status = 409;
       throw error;
     }
-    await this.db.deleteScheduleEntry(entry.id);
+    if (this.db.deleteScheduleEntryWithApproval) {
+      await this.db.deleteScheduleEntryWithApproval(entry, approval.contentRevision, {
+        reviewNotes: 'Schedule deleted; approval is required before scheduling again',
+        productionStatus: 'needs_review'
+      });
+    } else {
+      await this.db.deleteScheduleEntry(entry.id);
+    }
     this.publishQueue = this.publishQueue.filter(item => item.id !== entry.id);
     await this.syncShortStatus(entry, 'rendered');
     return entry;
   }
+
+  async isEntryApproved(entry) {
+    if (entry?.metadata?.contentType === 'short') {
+      const sourceProductionId = entry.metadata.sourceProductionId;
+      const shortClipId = entry.metadata.shortClipId;
+      const approval = await this.db.getContentApproval?.(sourceProductionId);
+      const clip = await this.db.getShortClip?.(shortClipId);
+      return approval?.status === 'approved' && Boolean(clip?.approvedAt) &&
+        ['scheduled', 'uploading', 'reconciliation_required', 'published'].includes(clip?.status) &&
+        clip.inheritedEvidence?.sourceContentRevision === approval.contentRevision;
+    }
+    const approval = await this.db.getContentApproval?.(entry?.productionId);
+    return approval?.status === 'approved';
+  }
+
+  async requireCurrentApproval(entry) {
+    if (entry?.metadata?.contentType === 'short') {
+      const sourceProductionId = entry.metadata.sourceProductionId;
+      const shortClipId = entry.metadata.shortClipId;
+      const approval = await this.db.getContentApproval?.(sourceProductionId);
+      const clip = await this.db.getShortClip?.(shortClipId);
+      if (approval?.status === 'approved' && Boolean(clip?.approvedAt) &&
+        ['scheduled', 'uploading', 'reconciliation_required', 'published'].includes(clip?.status) &&
+        clip.inheritedEvidence?.sourceContentRevision === approval.contentRevision) return approval;
+      throw this.approvalError();
+    }
+    const approval = await this.db.getContentApproval?.(entry?.productionId);
+    if (approval?.status === 'approved') return approval;
+    throw this.approvalError();
+  }
+
+  async persistApprovedScheduleEntry(entry, expectedRevision, options = {}) {
+    let saved;
+    if (this.db.updateScheduleEntryWithApproval) {
+      saved = await this.db.updateScheduleEntryWithApproval(entry, expectedRevision, options);
+    } else {
+      await this.db.updateScheduleEntry(entry);
+      saved = entry;
+    }
+    const index = this.publishQueue.findIndex(item => item.id === entry.id);
+    if (index >= 0) this.publishQueue[index] = saved || entry;
+    return saved || entry;
+  }
+
+  approvalError() {
+    const error = new Error('This schedule action requires current explicit operator approval');
+    error.status = 409;
+    error.code = 'CONTENT_NOT_APPROVED';
+    throw error;
+  }
 }
 
-module.exports = { PublishingSchedulingAgent };
+module.exports = { PublishingSchedulingAgent, buildYouTubeVideoMetadata };

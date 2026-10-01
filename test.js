@@ -21,6 +21,7 @@ class SystemTest {
     const tests = [
       { name: 'Database Connection', test: () => this.testDatabase() },
       { name: 'Production Persistence', test: () => this.testProductionPersistence() },
+      { name: 'Content Approval Audit', test: () => this.testContentApprovalAudit() },
       { name: 'Automation Events Table', test: () => this.testAutomationEventsTable() },
       { name: 'Local Activation Metrics', test: () => this.testActivationMetrics() },
       { name: 'Anonymous Telemetry Opt-in', test: () => this.testAnonymousTelemetryOptIn() },
@@ -41,6 +42,7 @@ class SystemTest {
       { name: 'Resumable Generation Checkpoints', test: () => this.testResumableGenerationCheckpoints() },
       { name: 'API Validation and Security', test: () => this.testAPIValidationAndSecurity() },
       { name: 'Publishing Safety', test: () => this.testPublishingSafety() },
+      { name: 'Publishing Queue Scheduling Disabled', test: () => this.testPublishingQueueSchedulingDisabled() },
       { name: 'Multi-Provider Credential Validation', test: () => this.testCredentialValidation() },
       { name: 'AI Text Service Token Compatibility', test: () => this.testAITextServiceTokenParams() },
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
@@ -158,6 +160,243 @@ class SystemTest {
     this.logger.info('Production persistence test completed successfully');
   }
 
+  async testContentApprovalAudit() {
+    const fs = require('fs').promises;
+    const os = require('os');
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'yaa-content-approval-'));
+    const productionId = `prod_approval_${Date.now()}`;
+    const db = new Database();
+    db.dbPath = path.join(directory, 'approval.db');
+    await db.initialize();
+
+    try {
+      if (await db.getSetting('auto_publish_enabled') !== 'false') {
+        throw new Error('Database initialization did not fail closed for automatic publishing');
+      }
+      await db.saveProductionData({
+        id: productionId, status: 'draft', assets: {}, timeline: {},
+        scheduledPublishTime: null, priority: 0, estimatedDuration: null
+      });
+      const legacyProductionId = `${productionId}_legacy`;
+      await db.saveProductionData({
+        id: legacyProductionId, status: 'approved', assets: {}, timeline: {},
+        scheduledPublishTime: null, priority: 0, estimatedDuration: null
+      });
+      await db.saveContentReview(legacyProductionId, { status: 'approved', reviewedAt: new Date().toISOString() });
+      await db.createTables();
+      if ((await db.getContentApproval(legacyProductionId))?.status !== 'pending') {
+        throw new Error('Legacy review status was treated as explicit approval during migration');
+      }
+
+      const initial = await db.setContentApproval(productionId, { status: 'pending' });
+      if (initial.status !== 'pending') throw new Error('A new content approval did not enter pending state');
+
+      const revision = await db.getContentRevision(productionId);
+      const approved = await db.approveContentAndSchedule({
+        productionId, expectedRevision: revision,
+        review: { editorData: {}, qualityChecks: [], reviewNotes: 'Reviewed locally' },
+        scheduleEntry: {
+          productionId, title: 'Approved fixture', publishTime: new Date(Date.now() + 86400000).toISOString(),
+          priority: 1, metadata: { seo: {}, video: { path: 'fixture.mp4' }, audio: {} }
+        },
+        decision: { status: 'approved', reviewNotes: 'Reviewed locally', reviewedBy: 'test-operator' }
+      });
+      if (approved.approval.status !== 'approved' || approved.approval.reviewedBy !== 'test-operator' || !approved.approval.reviewedAt) {
+        throw new Error('The approved decision was not persisted with reviewer and timestamp');
+      }
+
+      const approvedSchedule = await db.getLatestScheduleEntry(productionId);
+      const approvedHistory = await db.getContentApprovalHistory(productionId);
+      const generateId = db.generateId;
+      db.generateId = () => approvedHistory[0].id;
+      let approvalAuditRollback = false;
+      try {
+        await db.approveContentAndSchedule({
+          productionId, expectedRevision: approved.approval.contentRevision,
+          review: { editorData: {}, qualityChecks: [] }, scheduleEntry: approvedSchedule,
+          decision: { reviewedBy: 'test-operator' }
+        });
+      } catch (_) {
+        approvalAuditRollback = true;
+      } finally {
+        db.generateId = generateId;
+      }
+      if (
+        !approvalAuditRollback || (await db.getContentApprovalHistory(productionId)).length !== approvedHistory.length ||
+        (await db.getContentApproval(productionId)).status !== 'approved' ||
+        (await db.getLatestScheduleEntry(productionId)).title !== approvedSchedule.title
+      ) {
+        throw new Error('Approval, schedule and audit did not roll back together after an audit insert failure');
+      }
+
+      await db.saveContentReview(productionId, {
+        status: 'approved', editorData: { title: 'Changed after review' }, qualityChecks: []
+      });
+      if ((await db.getContentApproval(productionId)).status !== 'pending') {
+        throw new Error('A content revision change did not invalidate the stored approval');
+      }
+      let staleRevisionRejected = false;
+      try {
+        await db.approveContentAndSchedule({
+          productionId, expectedRevision: revision,
+          review: { editorData: {}, qualityChecks: [] },
+          scheduleEntry: { ...approvedSchedule, title: 'Stale approval attempt' },
+          decision: { reviewedBy: 'test-operator' }
+        });
+      } catch (error) {
+        staleRevisionRejected = error.code === 'STALE_CONTENT_REVISION';
+      }
+      const scheduleAfterStaleAttempt = await db.getLatestScheduleEntry(productionId);
+      if (!staleRevisionRejected || scheduleAfterStaleAttempt.title !== approvedSchedule.title) {
+        throw new Error('A stale approval changed the schedule despite a revision mismatch');
+      }
+
+      const raceId = `${productionId}_race`;
+      await db.saveProductionData({
+        id: raceId, status: 'draft', assets: {}, timeline: {},
+        scheduledPublishTime: null, priority: 0, estimatedDuration: null
+      });
+      await db.saveProductionSnapshot({
+        id: raceId, strategy: {}, script: { title: 'Race fixture' }, thumbnail: {}, seo: {}
+      });
+      await db.saveContentReview(raceId, { status: 'needs_review', editorData: {}, qualityChecks: [] });
+      const raceRevision = await db.getContentRevision(raceId);
+      const raceOperations = await Promise.allSettled([
+        db.approveContentAndSchedule({
+          productionId: raceId, expectedRevision: raceRevision,
+          review: { editorData: {}, qualityChecks: [] },
+          scheduleEntry: {
+            productionId: raceId, title: 'Race fixture', publishTime: new Date(Date.now() + 86400000).toISOString(),
+            priority: 1, metadata: {}
+          },
+          decision: { reviewedBy: 'test-operator' }
+        }),
+        db.saveContentReview(raceId, {
+          status: 'needs_review', editorData: { title: 'Concurrent edit' }, qualityChecks: []
+        })
+      ]);
+      const raceApproval = await db.getContentApproval(raceId);
+      if (raceOperations[1].status === 'fulfilled' && raceApproval?.status === 'approved') {
+        throw new Error('A concurrent content edit remained approved after the edit committed');
+      }
+
+      const rejected = await db.setContentApproval(productionId, {
+        status: 'rejected', reviewNotes: 'Needs changes', reviewedBy: 'test-operator'
+      });
+      if (rejected.status !== 'rejected') throw new Error('The rejected decision was not persisted');
+
+      const history = await db.getContentApprovalHistory(productionId);
+      if (
+        history.length !== 4 || history.map(event => event.status).join(',') !== 'pending,approved,pending,rejected' ||
+        history[1].previousStatus !== 'pending' || history[2].previousStatus !== 'approved' ||
+        history[3].previousStatus !== 'pending' || history[3].reviewNotes !== 'Needs changes'
+      ) {
+        throw new Error('Approval decision history did not preserve the full state transition sequence');
+      }
+
+      let invalidStatusRejected = false;
+      try {
+        await db.setContentApproval(productionId, { status: 'published' });
+      } catch (error) {
+        invalidStatusRejected = error.code === 'INVALID_APPROVAL_STATUS';
+      }
+      if (!invalidStatusRejected || (await db.getContentApprovalHistory(productionId)).length !== 4) {
+        throw new Error('Invalid approval status was accepted or appeared in the audit history');
+      }
+
+      const invalidationCases = [
+        ['production metadata', id => db.updateProductionData({
+          id, status: 'draft', assets: { finalVideo: { path: 'updated.mp4' } }, timeline: {},
+          scheduledPublishTime: null, priority: 1
+        })],
+        ['packaging metadata', id => db.saveProductionSnapshot({
+          id, strategy: {}, script: { title: 'Updated title' }, thumbnail: { path: 'updated.jpg' }, seo: {}
+        })],
+        ['editor metadata', id => db.saveContentReview(id, {
+          status: 'needs_review', editorData: { title: 'Edited after approval' }, qualityChecks: []
+        })],
+        ['provenance', id => db.saveContentProvenance(id, {
+          sources: [{ id: 'source-1' }], claims: [], status: 'verified', containsSyntheticMedia: false
+        })],
+        ['scene metadata', id => db.replaceProductionScenes(id, [
+          { id: `${id}_scene`, label: 'Updated scene', duration: 5, scriptText: 'Updated narration' }
+        ])],
+        ['discoverability metadata', id => db.saveDiscoverabilityAudit(id, 'youtube', {
+          status: 'complete', summary: { checked: true }, findings: []
+        })]
+      ];
+      for (const [name, mutate] of invalidationCases) {
+        const id = `${productionId}_${name.replaceAll(' ', '_')}`;
+        await db.saveProductionData({
+          id, status: 'draft', assets: {}, timeline: {}, scheduledPublishTime: null,
+          priority: 0, estimatedDuration: null
+        });
+        await db.saveProductionSnapshot({ id, strategy: {}, script: { title: name }, thumbnail: {}, seo: {} });
+        const currentRevision = await db.getContentRevision(id);
+        await db.approveContentAndSchedule({
+          productionId: id, expectedRevision: currentRevision,
+          review: { editorData: {}, qualityChecks: [] },
+          scheduleEntry: {
+            productionId: id, title: name, publishTime: new Date(Date.now() + 86400000).toISOString(),
+            priority: 0, metadata: {}
+          },
+          decision: { reviewedBy: 'test-operator' }
+        });
+        await mutate(id);
+        const afterMutation = await db.getContentApproval(id);
+        if (afterMutation?.status !== 'pending') {
+          throw new Error(`${name} change did not invalidate approval`);
+        }
+      }
+
+      const scheduleCasId = `${productionId}_schedule_cas`;
+      await db.saveProductionData({
+        id: scheduleCasId, status: 'draft', assets: {}, timeline: {},
+        scheduledPublishTime: null, priority: 0, estimatedDuration: null
+      });
+      await db.saveProductionSnapshot({ id: scheduleCasId, strategy: {}, script: { title: 'Schedule CAS' }, thumbnail: {}, seo: {} });
+      const scheduleCasRevision = await db.getContentRevision(scheduleCasId);
+      const scheduleApproval = await db.approveContentAndSchedule({
+        productionId: scheduleCasId, expectedRevision: scheduleCasRevision,
+        review: { editorData: {}, qualityChecks: [] },
+        scheduleEntry: {
+          productionId: scheduleCasId, title: 'Schedule CAS',
+          publishTime: new Date(Date.now() + 86400000).toISOString(), priority: 0, metadata: {}
+        },
+        decision: { reviewedBy: 'test-operator' }
+      });
+      const approvedScheduleCas = await db.getLatestScheduleEntry(scheduleCasId);
+      let staleScheduleMutationRejected = false;
+      try {
+        await db.updateScheduleEntryWithApproval({
+          ...approvedScheduleCas, publishTime: new Date(Date.now() + 172800000).toISOString()
+        }, 'outdated-revision', { invalidateApproval: true });
+      } catch (error) {
+        staleScheduleMutationRejected = error.code === 'CONTENT_NOT_APPROVED';
+      }
+      if (
+        !staleScheduleMutationRejected ||
+        (await db.getLatestScheduleEntry(scheduleCasId)).publishTime !== approvedScheduleCas.publishTime ||
+        (await db.getContentApproval(scheduleCasId)).status !== 'approved'
+      ) {
+        throw new Error('A stale approval mutated a schedule or approval state');
+      }
+      await db.updateScheduleEntryWithApproval({
+        ...approvedScheduleCas, publishTime: new Date(Date.now() + 172800000).toISOString()
+      }, scheduleApproval.approval.contentRevision, {
+        invalidateApproval: true, productionStatus: 'scheduled'
+      });
+      if ((await db.getContentApproval(scheduleCasId)).status !== 'pending') {
+        throw new Error('A reschedule did not atomically invalidate approval for the changed schedule revision');
+      }
+    } finally {
+      await db.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+
+    this.logger.info('Content approval audit test completed successfully');
+  }
+
   async testAutomationEventsTable() {
     const db = new Database();
     await db.initialize();
@@ -271,9 +510,13 @@ class SystemTest {
     const { OperatorService } = require('./utils/operator-service');
     const db = new Database();
     await db.initialize();
+    const previousApiKey = process.env.API_KEY;
+    process.env.API_KEY = 'test-api-key';
     let server;
     let job;
     let learningRecommendation;
+    let approvalProductionId;
+    let legacyPublishCalls = 0;
 
     try {
       job = await db.createGenerationJob({ topic: 'Operator workflow test', style: 'explainer', length: 'short' });
@@ -293,11 +536,26 @@ class SystemTest {
       if (quality.passed || !quality.blockingFailures.includes('video')) {
         throw new Error('Quality gate did not block a simulated video');
       }
+      operator.runQualityChecks = async () => ({ passed: true, score: 100, checks: [], blockingFailures: [] });
 
       const agent = new YouTubeAutomationAgent();
       agent.db = db;
       agent.operator = operator;
       agent.agents = {
+        publishing: {
+          loadPublishQueue: async () => {},
+          publishContent: async () => { legacyPublishCalls++; return { status: 'published' }; },
+          prepareScheduleEntry: async production => ({
+            productionId: production.id, title: production.script.title,
+            publishTime: production.scheduledPublishTime || new Date(Date.now() + 86400000).toISOString(),
+            status: 'scheduled', priority: production.priority, metadata: {}
+          }),
+          scheduleContent: async production => ({
+            id: `schedule-${production.id}`, productionId: production.id, title: production.script.title,
+            publishTime: new Date(Date.now() + 86400000).toISOString(), status: 'scheduled',
+            priority: production.priority, metadata: {}
+          })
+        },
         analytics: {
           getRecentAnalytics: async () => ({ totalVideos: 0, averagePerformanceScore: 0, topPerformers: [], insights: [] })
         }
@@ -326,7 +584,7 @@ class SystemTest {
       }
       const unavailableStart = await fetch(`http://127.0.0.1:${port}/api/operator/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-api-key': 'test-api-key' },
         body: '{}'
       });
       if (unavailableStart.status !== 503) {
@@ -344,16 +602,106 @@ class SystemTest {
       });
       const approveLearning = await fetch(
         `http://127.0.0.1:${port}/api/learning/recommendations/${learningRecommendation.id}/approve`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+        { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': 'test-api-key' }, body: '{}' }
       );
       const approvedLearning = await approveLearning.json();
       if (!approveLearning.ok || approvedLearning.result?.status !== 'approved') {
         throw new Error('Learning recommendation review API did not persist approval');
       }
+
+      approvalProductionId = `prod-approval-api-${Date.now()}`;
+      await db.saveProductionData({
+        id: approvalProductionId, status: 'draft',
+        assets: { finalVideo: { path: 'local-fixture.mp4', simulated: false } }, timeline: {},
+        scheduledPublishTime: null, priority: 1, estimatedDuration: null
+      });
+      await db.saveProductionSnapshot({
+        id: approvalProductionId,
+        strategy: { topic: 'Approval API fixture' },
+        script: { title: 'Approval API fixture', fullScript: 'Reviewed fixture script.' },
+        thumbnail: {}, seo: { title: 'Approval API fixture', description: 'Fixture description', tags: ['fixture'] }
+      });
+      const disableApprovalSetting = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'x-api-key': 'test-api-key' },
+        body: JSON.stringify({ approval_required: false })
+      });
+      if (disableApprovalSetting.status !== 400 || await db.getSetting('approval_required') !== 'true') {
+        throw new Error('The API allowed human approval to be disabled');
+      }
+      const legacyPublish = await fetch(`http://127.0.0.1:${port}/publish/${approvalProductionId}`, {
+        method: 'POST', headers: { 'x-api-key': 'test-api-key' }
+      });
+      if (legacyPublish.status !== 409 || legacyPublishCalls !== 0) {
+        throw new Error('Legacy publishing reached its publishing agent without explicit approval');
+      }
+      const unauthenticatedHistory = await fetch(
+        `http://127.0.0.1:${port}/api/content/${approvalProductionId}/approval-history`
+      );
+      if (unauthenticatedHistory.status !== 401) {
+        throw new Error('Approval history endpoint did not require API authentication');
+      }
+
+      const approveContent = await fetch(
+        `http://127.0.0.1:${port}/api/content/${approvalProductionId}/approve`,
+        {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': 'test-api-key' },
+          body: JSON.stringify({ factChecked: true, rightsConfirmed: true, reviewNotes: 'API approval fixture' })
+        }
+      );
+      if (!approveContent.ok || (await db.getContentApproval(approvalProductionId))?.status !== 'approved') {
+        throw new Error('Authenticated approve route did not persist explicit approval');
+      }
+
+      const rejectContent = await fetch(
+        `http://127.0.0.1:${port}/api/content/${approvalProductionId}/reject`,
+        {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': 'test-api-key' },
+          body: JSON.stringify({ notes: 'Reject API audit fixture' })
+        }
+      );
+      if (!rejectContent.ok || (await db.getContentApproval(approvalProductionId))?.status !== 'rejected') {
+        throw new Error('Authenticated reject route did not persist the rejected approval state');
+      }
+
+      const editDraft = await fetch(
+        `http://127.0.0.1:${port}/api/content/${approvalProductionId}`,
+        {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json', 'x-api-key': 'test-api-key' },
+          body: JSON.stringify({ title: 'Revised draft after rejection' })
+        }
+      );
+      const editedDraft = await editDraft.json();
+      if (!editDraft.ok || editedDraft.result?.approval?.status !== 'pending') {
+        throw new Error('Editing rejected content did not return it to pending approval');
+      }
+      const approvalHistoryResponse = await fetch(
+        `http://127.0.0.1:${port}/api/content/${approvalProductionId}/approval-history`,
+        { headers: { 'x-api-key': 'test-api-key' } }
+      );
+      const approvalHistory = await approvalHistoryResponse.json();
+      if (
+        !approvalHistoryResponse.ok || approvalHistory.result?.approval?.status !== 'pending' ||
+        approvalHistory.result?.events?.length !== 4 ||
+        approvalHistory.result?.events?.[0]?.status !== 'approved' ||
+        approvalHistory.result?.events?.[1]?.status !== 'pending' ||
+        approvalHistory.result?.events?.[2]?.reviewNotes !== 'Reject API audit fixture' ||
+        approvalHistory.result?.events?.at(-1)?.status !== 'pending'
+      ) {
+        throw new Error('Approval history API did not return reject and draft-reset decisions');
+      }
     } finally {
       if (server) await new Promise(resolve => server.close(resolve));
       if (job) await db.executeQuery('DELETE FROM generation_jobs WHERE id = ?', [job.id]);
       if (learningRecommendation) await db.executeQuery('DELETE FROM learning_recommendations WHERE id = ?', [learningRecommendation.id]);
+      if (approvalProductionId) {
+        await db.executeQuery('DELETE FROM content_approval_events WHERE production_id = ?', [approvalProductionId]);
+        await db.executeQuery('DELETE FROM content_approvals WHERE production_id = ?', [approvalProductionId]);
+        await db.executeQuery('DELETE FROM content_reviews WHERE production_id = ?', [approvalProductionId]);
+        await db.executeQuery('DELETE FROM production_snapshots WHERE production_id = ?', [approvalProductionId]);
+        await db.executeQuery('DELETE FROM productions WHERE id = ?', [approvalProductionId]);
+      }
+      if (previousApiKey === undefined) delete process.env.API_KEY;
+      else process.env.API_KEY = previousApiKey;
       await db.close();
     }
 
@@ -635,30 +983,42 @@ class SystemTest {
         evidence: { measuredVideos: 4 }, proposedChange: { experiment: 'title_thumbnail_variant' }, confidence: 'medium'
       });
       await db.reviewLearningRecommendation(sourceLearning.id, 'approved');
-      await db.saveContentReview(productionId, {
-        status: 'approved',
-        editorData: {
-          packagingExperiment: {
-            sourceRecommendationId: sourceLearning.id,
-            hypothesis: 'A clearer promise improves qualified clicks.',
-            titleVariants: [
-              { label: 'Control', title: 'Control title' },
-              { label: 'Clear benefit', title: 'A Clearer Automation Benefit' },
-              { label: 'Curiosity', title: 'The Automation Detail You Missed' }
-            ],
-            thumbnailVariants: [
-              { label: 'Control', path: thumbnails[0] },
-              { label: 'Clear benefit', path: thumbnails[1] },
-              { label: 'Curiosity', path: thumbnails[2] }
-            ]
-          }
+      const editorData = {
+        packagingExperiment: {
+          sourceRecommendationId: sourceLearning.id,
+          hypothesis: 'A clearer promise improves qualified clicks.',
+          titleVariants: [
+            { label: 'Control', title: 'Control title' },
+            { label: 'Clear benefit', title: 'A Clearer Automation Benefit' },
+            { label: 'Curiosity', title: 'The Automation Detail You Missed' }
+          ],
+          thumbnailVariants: [
+            { label: 'Control', path: thumbnails[0] },
+            { label: 'Clear benefit', path: thumbnails[1] },
+            { label: 'Curiosity', path: thumbnails[2] }
+          ]
         }
+      };
+      await db.saveContentReview(productionId, {
+        status: 'needs_review', editorData, qualityChecks: []
       });
-      const schedule = await db.saveScheduleEntry({
+      const reviewedRevision = await db.getContentRevision(productionId);
+      const scheduleCandidate = {
         productionId, title: 'Control title', publishTime: new Date(Date.now() - 8 * 86400000).toISOString(),
         status: 'published', priority: 50,
         metadata: { seo: { title: 'Control title', description: 'Fixture', tags: [] }, thumbnail: { path: thumbnails[0] } }
+      };
+      const approval = await db.approveContentAndSchedule({
+        productionId,
+        expectedRevision: reviewedRevision,
+        review: { editorData, qualityChecks: [], reviewNotes: 'Approved growth experiment fixture' },
+        scheduleEntry: scheduleCandidate,
+        decision: { status: 'approved', reviewedBy: 'test-operator' }
       });
+      if (approval.approval?.status !== 'approved' || approval.approval.contentRevision !== await db.getContentRevision(productionId)) {
+        throw new Error('The growth experiment fixture was not explicitly approved at its current revision');
+      }
+      const schedule = await db.getLatestScheduleEntry(productionId);
       schedule.status = 'published';
       schedule.youtubeId = 'youtube-experiment-1';
       schedule.youtubeUrl = 'https://www.youtube.com/watch?v=youtube-experiment-1';
@@ -1545,6 +1905,20 @@ class SystemTest {
         { id: 'short-source-2', label: 'Method', scriptText: 'Use the approved scene evidence to build a vertical excerpt.', prompt: 'Method', duration: 1.3, assetType: 'video', assetPath: sourceVideo, audioPath, status: 'ready', narrationStatus: 'current', rightsConfirmed: true },
         { id: 'short-source-3', label: 'Result', scriptText: 'Render locally and review every Short before it reaches the schedule.', prompt: 'Result', duration: 1.3, assetType: 'video', assetPath: sourceVideo, audioPath, status: 'ready', narrationStatus: 'current', rightsConfirmed: true }
       ]);
+      const sourceRevision = await db.getContentRevision(productionId);
+      await db.approveContentAndSchedule({
+        productionId, expectedRevision: sourceRevision,
+        review: { editorData: { factChecked: true, rightsConfirmed: true }, qualityChecks: [] },
+        scheduleEntry: {
+          productionId, title: production.script.title, publishTime: production.scheduledPublishTime,
+          priority: production.priority,
+          metadata: {
+            seo: production.seo, thumbnail: production.assets.thumbnail, video: production.assets.finalVideo,
+            audio: production.assets.audio, captions: null, privacyStatus: 'private'
+          }
+        },
+        decision: { reviewedBy: 'test-operator' }
+      });
 
       const publishing = new PublishingSchedulingAgent(db, {});
       const service = new ShortsRepurposingService(db, publishing, {
@@ -1582,6 +1956,9 @@ class SystemTest {
       ) {
         throw new Error('Approved Short did not inherit evidence into an independent schedule entry');
       }
+      if (!await publishing.isEntryApproved(schedule)) {
+        throw new Error('Short publishing did not bind approval to the current source revision and clip approval');
+      }
       schedule.status = 'published';
       schedule.youtubeId = 'youtube-short-1';
       schedule.youtubeUrl = 'https://www.youtube.com/shorts/youtube-short-1';
@@ -1606,7 +1983,7 @@ class SystemTest {
     const os = require('os');
     const { ProvenanceService } = require('./utils/provenance-service');
     const { OperatorService } = require('./utils/operator-service');
-    const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
+    const { PublishingSchedulingAgent, buildYouTubeVideoMetadata } = require('./agents/publishing-scheduling-agent');
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'yaa-provenance-'));
     const db = new Database();
     db.dbPath = path.join(directory, 'provenance.db');
@@ -1699,22 +2076,29 @@ class SystemTest {
         throw new Error('Verified provenance did not satisfy the production quality gate');
       }
 
-      let uploadRequest;
-      const publishing = new PublishingSchedulingAgent(db, {});
-      publishing.youtube = {
-        videos: { insert: async request => { uploadRequest = request; return { data: { id: 'provenance-video' } }; } }
-      };
-      await publishing.uploadToYouTube({
-        publishTime: new Date(Date.now() + 86400000).toISOString(),
+      const now = Date.parse('2026-01-01T00:00:00.000Z');
+      const publishTime = new Date(now + 86400000).toISOString();
+      const uploadEntry = {
+        publishTime,
         metadata: {
           seo: production.seo,
-          video: { path: videoPath },
           privacyStatus: 'private',
           containsSyntheticMedia: true
         }
-      });
-      if (uploadRequest?.requestBody?.status?.containsSyntheticMedia !== true) {
-        throw new Error('Synthetic-media disclosure was not handed to the YouTube upload request');
+      };
+      const originalUploadEntry = JSON.stringify(uploadEntry);
+      const builtMetadata = buildYouTubeVideoMetadata(uploadEntry, {}, now, 'unlisted');
+      const snippet = builtMetadata.videoMetadata.snippet;
+      const uploadStatus = builtMetadata.videoMetadata.status;
+      if (
+        snippet.title !== production.seo.title || snippet.description !== production.seo.description ||
+        JSON.stringify(snippet.tags) !== JSON.stringify(production.seo.tags) ||
+        snippet.categoryId !== '22' || snippet.defaultLanguage !== 'en' || snippet.defaultAudioLanguage !== 'en' ||
+        uploadStatus.privacyStatus !== 'private' || uploadStatus.selfDeclaredMadeForKids !== false ||
+        uploadStatus.containsSyntheticMedia !== true || uploadStatus.publishAt !== publishTime ||
+        JSON.stringify(uploadEntry) !== originalUploadEntry
+      ) {
+        throw new Error('Pure upload metadata construction changed fields or omitted synthetic-media disclosure');
       }
 
       let emptyWaiverRejected = false;
@@ -1745,6 +2129,7 @@ class SystemTest {
     const db = new Database();
     db.dbPath = path.join(directory, 'discoverability.db');
     await db.initialize();
+    const previousApiKey = process.env.API_KEY;
     const productionId = 'prod-discoverability-test';
     const fakeAdapter = {
       audit: async content => ({
@@ -1847,13 +2232,14 @@ class SystemTest {
       apiAgent.db = db;
       apiAgent.operator = new OperatorService(db);
       apiAgent.discoverability = service;
+      process.env.API_KEY = 'test-api-key';
       apiAgent.setupAPI();
       const server = await new Promise(resolve => {
         const listener = apiAgent.app.listen(0, '127.0.0.1', () => resolve(listener));
       });
       try {
         const address = server.address();
-        const apiHeaders = { 'content-type': 'application/json', ...(process.env.API_KEY ? { 'x-api-key': process.env.API_KEY } : {}) };
+        const apiHeaders = { 'content-type': 'application/json', 'x-api-key': 'test-api-key' };
         const runResponse = await fetch(`http://127.0.0.1:${address.port}/api/content/${productionId}/discoverability/run`, {
           method: 'POST', headers: apiHeaders, body: JSON.stringify({ platform: 'youtube' })
         });
@@ -1886,6 +2272,8 @@ class SystemTest {
         throw new Error('DarkzSEO runtime availability did not remain an explicit non-blocking check');
       }
     } finally {
+      if (previousApiKey === undefined) delete process.env.API_KEY;
+      else process.env.API_KEY = previousApiKey;
       await db.close();
       await fs.rm(directory, { recursive: true, force: true });
     }
@@ -2153,33 +2541,43 @@ class SystemTest {
     }
 
     const previousKey = process.env.API_KEY;
-    process.env.API_KEY = 'test-secret';
-    const middleware = agent.requireAPIKey();
+    try {
+      const middleware = agent.requireAPIKey();
+      for (const apiKey of [undefined, '', '   ']) {
+        if (apiKey === undefined) delete process.env.API_KEY;
+        else process.env.API_KEY = apiKey;
 
-    let rejectedNextCalled = false;
-    const rejectedResponse = this.createMockResponse();
-    middleware({ get: () => 'wrong-secret' }, rejectedResponse, () => {
-      rejectedNextCalled = true;
-    });
+        let nextCalled = false;
+        const response = this.createMockResponse();
+        middleware({ get: () => 'test-secret' }, response, () => { nextCalled = true; });
+        if (nextCalled || response.statusCode !== 503) {
+          throw new Error(`Missing/empty API_KEY configuration was not rejected (value: ${String(apiKey)})`);
+        }
+      }
 
-    if (rejectedNextCalled || rejectedResponse.statusCode !== 401) {
-      throw new Error('Invalid API key was not rejected');
-    }
+      process.env.API_KEY = 'test-secret';
+      let rejectedNextCalled = false;
+      const rejectedResponse = this.createMockResponse();
+      middleware({ get: () => 'wrong-secret' }, rejectedResponse, () => {
+        rejectedNextCalled = true;
+      });
 
-    let acceptedNextCalled = false;
-    const acceptedResponse = this.createMockResponse();
-    middleware({ get: () => 'test-secret' }, acceptedResponse, () => {
-      acceptedNextCalled = true;
-    });
+      if (rejectedNextCalled || rejectedResponse.statusCode !== 401) {
+        throw new Error('Invalid API key was not rejected');
+      }
 
-    if (!acceptedNextCalled || acceptedResponse.statusCode) {
-      throw new Error('Valid API key was not accepted');
-    }
+      let acceptedNextCalled = false;
+      const acceptedResponse = this.createMockResponse();
+      middleware({ get: () => 'test-secret' }, acceptedResponse, () => {
+        acceptedNextCalled = true;
+      });
 
-    if (previousKey === undefined) {
-      delete process.env.API_KEY;
-    } else {
-      process.env.API_KEY = previousKey;
+      if (!acceptedNextCalled || acceptedResponse.statusCode) {
+        throw new Error('Valid API key was not accepted');
+      }
+    } finally {
+      if (previousKey === undefined) delete process.env.API_KEY;
+      else process.env.API_KEY = previousKey;
     }
 
     this.logger.info('API validation and security test completed successfully');
@@ -2208,19 +2606,65 @@ class SystemTest {
       silenceConfirmedAt: new Date().toISOString()
     };
     const agent = new PublishingSchedulingAgent({
-      updateScheduleEntry: async () => {}
+      updateScheduleEntry: async () => {},
+      getContentApproval: async () => ({ status: 'approved' })
     }, {});
 
     agent.publishQueue = [
       { productionId: 'prod-a', title: 'A', status: 'scheduled', metadata: { audio: intentionalAudio } },
       { productionId: 'prod-b', title: 'B', status: 'scheduled', metadata: { audio: intentionalAudio } }
     ];
+    // This stub tests publishContent's queue bookkeeping only; it does not exercise the real upload boundary.
     agent.uploadToYouTube = async () => ({ id: 'youtube-1' });
 
     await agent.publishContent('prod-a');
 
     if (agent.publishQueue.length !== 1 || agent.publishQueue[0].productionId !== 'prod-b') {
       throw new Error('publishContent removed the wrong publish queue entries');
+    }
+
+    const readinessBlocked = new PublishingSchedulingAgent({
+      getLatestReadinessRun: async () => ({
+        status: 'failed', checks: [{ id: 'video', blocking: true, status: 'failed' }]
+      }),
+      updateScheduleEntry: async () => {}
+    }, {});
+    readinessBlocked.publishQueue = [{
+      productionId: 'prod-readiness-blocked', status: 'scheduled', metadata: { audio: intentionalAudio }
+    }];
+    let readinessUploadCalls = 0;
+    readinessBlocked.uploadToYouTube = async () => { readinessUploadCalls++; };
+    let readinessPublishBlocked = false;
+    try {
+      await readinessBlocked.publishContent('prod-readiness-blocked');
+    } catch (error) {
+      readinessPublishBlocked = error.code === 'READINESS_BLOCKED';
+    }
+    if (!readinessPublishBlocked || readinessUploadCalls !== 0) {
+      throw new Error('Publishing did not enforce readiness before reaching the upload boundary');
+    }
+
+    for (const reviewStatus of [null, 'pending', 'rejected']) {
+      let approvalUploadCalls = 0;
+      let approvalScheduleUpdates = 0;
+      const approvalBlocked = new PublishingSchedulingAgent({
+        getContentApproval: async () => reviewStatus ? ({ status: reviewStatus }) : null,
+        updateScheduleEntry: async () => { approvalScheduleUpdates++; }
+      }, {});
+      approvalBlocked.publishQueue = [{
+        id: `schedule-${reviewStatus || 'missing'}`, productionId: `prod-${reviewStatus || 'missing'}`,
+        status: 'scheduled', metadata: { audio: intentionalAudio }
+      }];
+      approvalBlocked.uploadToYouTube = async () => { approvalUploadCalls++; };
+      let approvalRejected = false;
+      try {
+        await approvalBlocked.publishContent(`prod-${reviewStatus || 'missing'}`);
+      } catch (error) {
+        approvalRejected = error.code === 'CONTENT_NOT_APPROVED' && error.status === 409;
+      }
+      if (!approvalRejected || approvalUploadCalls !== 0 || approvalScheduleUpdates !== 0) {
+        throw new Error(`Publishing did not fail closed for ${reviewStatus || 'missing'} approval state`);
+      }
     }
 
     const missingNarration = new PublishingSchedulingAgent({ updateScheduleEntry: async () => {} }, {});
@@ -2247,11 +2691,13 @@ class SystemTest {
 
     let uncertainUpdates = [];
     const uncertain = new PublishingSchedulingAgent({
-      updateScheduleEntry: async entry => uncertainUpdates.push({ ...entry })
+      updateScheduleEntry: async entry => uncertainUpdates.push({ ...entry }),
+      getContentApproval: async () => ({ status: 'approved' })
     }, {});
     uncertain.publishQueue = [
       { id: 'schedule-uncertain', productionId: 'prod-uncertain', title: 'Uncertain', status: 'scheduled', metadata: { audio: intentionalAudio } }
     ];
+    // This injected failure tests publishContent's uncertain-outcome reconciliation workflow, not the real upload boundary.
     let uploadAttempts = 0;
     uncertain.uploadToYouTube = async entry => {
       uploadAttempts++;
@@ -2282,6 +2728,7 @@ class SystemTest {
     };
     const reconcile = new PublishingSchedulingAgent({
       getLatestScheduleEntry: async () => recorded,
+      getContentApproval: async () => ({ status: 'approved' }),
       updateScheduleEntry: async () => {}
     }, {});
     reconcile.youtube = {
@@ -2292,6 +2739,7 @@ class SystemTest {
         }
       }
     };
+    // The recorded-upload case tests read-only reconciliation and must not invoke an upload.
     reconcile.uploadToYouTube = async () => {
       throw new Error('A recorded upload must never be uploaded again');
     };
@@ -2303,7 +2751,8 @@ class SystemTest {
     let deletedScheduleId = null;
     const scheduleActions = new PublishingSchedulingAgent({
       updateScheduleEntry: async () => {},
-      deleteScheduleEntry: async id => { deletedScheduleId = id; }
+      deleteScheduleEntry: async id => { deletedScheduleId = id; },
+      getContentApproval: async () => ({ status: 'approved' })
     }, {});
     scheduleActions.publishQueue = [{
       id: 'schedule-actions', productionId: 'prod-actions', title: 'Actions', status: 'scheduled',
@@ -2319,22 +2768,137 @@ class SystemTest {
       throw new Error('Deleting a schedule did not preserve content while removing the queue entry');
     }
 
-    let uploadMetadata = null;
-    const immediate = new PublishingSchedulingAgent({ updateScheduleEntry: async () => {} }, {});
-    immediate.youtube = {
-      videos: { insert: async request => { uploadMetadata = request.requestBody; return { data: { id: 'youtube-now' } }; } },
-      thumbnails: { set: async () => {} }, captions: { insert: async () => {} }
+    let blockedScheduleWrites = 0;
+    const unapprovedActions = new PublishingSchedulingAgent({
+      getContentApproval: async () => ({ status: 'pending' }),
+      saveScheduleEntry: async () => { blockedScheduleWrites++; },
+      updateScheduleEntry: async () => { blockedScheduleWrites++; },
+      deleteScheduleEntry: async () => { blockedScheduleWrites++; }
+    }, {});
+    const unapprovedEntry = {
+      id: 'schedule-pending', productionId: 'prod-pending-actions', status: 'scheduled',
+      title: 'Pending', publishTime: new Date(Date.now() - 3600000).toISOString(),
+      metadata: { audio: intentionalAudio }
     };
-    immediate.getVideoStream = async () => ({ fixture: true });
-    await immediate.uploadToYouTube({
-      id: 'schedule-now', publishTime: new Date().toISOString(),
-      metadata: { seo: { title: 'Publish now', description: 'Immediate upload.', tags: ['test'] }, video: { path: 'fixture.mp4' }, privacyStatus: 'public' }
-    }, { publishNow: true });
-    if (uploadMetadata?.status?.privacyStatus !== 'public' || uploadMetadata?.status?.publishAt !== undefined) {
-      throw new Error('Publish now still sent a stale scheduled publishAt value');
+    unapprovedActions.publishQueue = [unapprovedEntry];
+    for (const action of [
+      () => unapprovedActions.rescheduleContent(unapprovedEntry.productionId, new Date(Date.now() + 7200000).toISOString()),
+      () => unapprovedActions.resumeScheduledContent(unapprovedEntry.productionId),
+      () => unapprovedActions.emergencyPublish(unapprovedEntry.productionId, 5),
+      () => unapprovedActions.emergencyPublish(unapprovedEntry.productionId),
+      () => unapprovedActions.pauseScheduledContent(unapprovedEntry.productionId),
+      () => unapprovedActions.deleteScheduledContent(unapprovedEntry.productionId),
+      () => unapprovedActions.scheduleContent({
+        id: unapprovedEntry.productionId, script: { title: 'Pending' }, seo: {}, priority: 0,
+        scheduledPublishTime: new Date(Date.now() + 3600000).toISOString(),
+        assets: { finalVideo: { path: 'fixture.mp4' }, audio: intentionalAudio }
+      })
+    ]) {
+      let rejected = false;
+      try { await action(); } catch (error) { rejected = error.code === 'CONTENT_NOT_APPROVED'; }
+      if (!rejected) throw new Error('An unapproved scheduling or queue action was accepted');
+    }
+    await unapprovedActions.processPublishQueue();
+    unapprovedActions.getChannelAnalytics = async () => ({});
+    unapprovedActions.calculateOptimalTimes = () => [];
+    unapprovedActions.findBetterTime = () => new Date(Date.now() + 10800000);
+    await unapprovedActions.optimizePublishTimes();
+    if (blockedScheduleWrites !== 0 || unapprovedEntry.status !== 'scheduled') {
+      throw new Error('An unapproved action mutated schedule or publishing state');
     }
 
+    const { buildYouTubeVideoMetadata } = require('./agents/publishing-scheduling-agent');
+    const now = Date.now();
+    const immediateEntry = {
+      id: 'schedule-now', publishTime: new Date(now + 86400000).toISOString(),
+      metadata: {
+        seo: { title: 'Publish now', description: 'Immediate upload.', tags: ['test'] },
+        video: { path: 'fixture.mp4' }, privacyStatus: 'public'
+      }
+    };
+    const immediateMetadata = buildYouTubeVideoMetadata(immediateEntry, { publishNow: true }, now, 'private');
+    if (immediateMetadata.videoMetadata.status.privacyStatus !== 'public' || immediateMetadata.videoMetadata.status.publishAt !== undefined) {
+      throw new Error('Publish-now metadata still sent a stale scheduled publishAt value');
+    }
+    const configuredDefault = buildYouTubeVideoMetadata({
+      ...immediateEntry,
+      metadata: { ...immediateEntry.metadata, privacyStatus: undefined }
+    }, { publishNow: true }, now, 'unlisted');
+    if (configuredDefault.videoMetadata.status.privacyStatus !== 'unlisted') {
+      throw new Error('The explicitly supplied default privacy status was not preserved');
+    }
+
+    let videoInsertCalls = 0;
+    let videoStreamCalls = 0;
+    const immediate = new PublishingSchedulingAgent({ updateScheduleEntry: async () => {} }, {});
+    immediate.youtube = {
+      videos: { insert: async () => { videoInsertCalls++; return { data: { id: 'youtube-now' } }; } },
+      thumbnails: { set: async () => {} }, captions: { insert: async () => {} }
+    };
+    immediate.getVideoStream = async () => { videoStreamCalls++; return { fixture: true }; };
+    let uploadBoundaryBlocked = false;
+    try {
+      await immediate.uploadToYouTube(immediateEntry, { publishNow: true });
+    } catch (error) {
+      uploadBoundaryBlocked = error.code === 'YOUTUBE_UPLOAD_DISABLED' && error.status === 403;
+    }
+    if (!uploadBoundaryBlocked || videoInsertCalls !== 0 || videoStreamCalls !== 0) {
+      throw new Error('The real upload boundary did not reject before file access or videos.insert');
+    }
+
+    let auxiliaryYouTubeWrites = 0;
+    const draftOnlyAuxiliary = new PublishingSchedulingAgent({}, {});
+    draftOnlyAuxiliary.youtube = {
+      videos: { update: async () => { auxiliaryYouTubeWrites++; }, list: async () => { auxiliaryYouTubeWrites++; } },
+      thumbnails: { set: async () => { auxiliaryYouTubeWrites++; } },
+      captions: { insert: async () => { auxiliaryYouTubeWrites++; } }
+    };
+    for (const action of [
+      () => draftOnlyAuxiliary.uploadThumbnail('video-id', 'fixture.jpg'),
+      () => draftOnlyAuxiliary.applyVideoPackaging('video-id', { title: 'Draft', thumbnailPath: 'fixture.jpg' }),
+      () => draftOnlyAuxiliary.uploadCaptions('video-id', 'fixture.srt')
+    ]) {
+      let blocked = false;
+      try { await action(); } catch (error) { blocked = error.code === 'YOUTUBE_UPLOAD_DISABLED'; }
+      if (!blocked) throw new Error('An auxiliary YouTube write escaped the draft-only boundary');
+    }
+    if (auxiliaryYouTubeWrites !== 0) throw new Error('An auxiliary YouTube API write ran in draft-only mode');
+
     this.logger.info('Publishing safety test completed successfully');
+  }
+
+  async testPublishingQueueSchedulingDisabled() {
+    const cron = require('node-cron');
+    const originalSchedule = cron.schedule;
+    const scheduledExpressions = [];
+    const startedExpressions = [];
+    cron.schedule = (expression, callback, options) => {
+      const task = {
+        expression, callback, options, running: false,
+        start() { this.running = true; startedExpressions.push(expression); },
+        stop() { this.running = false; }
+      };
+      scheduledExpressions.push(expression);
+      return task;
+    };
+
+    try {
+      const scheduler = new DailyAutomation({}, {});
+      await scheduler.setupScheduledTasks();
+      if (scheduler.scheduledTasks.has('publish-queue-processing')) {
+        throw new Error('A scheduled publishing queue task was registered');
+      }
+      if ([...scheduler.scheduledTasks.values()].some(task => !task || typeof task.start !== 'function')) {
+        throw new Error('A scheduled task was registered without a task object');
+      }
+      if (scheduledExpressions.includes('*/15 * * * *') || startedExpressions.includes('*/15 * * * *')) {
+        throw new Error('The publishing queue task was scheduled or started');
+      }
+    } finally {
+      cron.schedule = originalSchedule;
+    }
+
+    this.logger.info('Publishing queue scheduling disabled test completed successfully');
   }
 
   async testCredentialValidation() {
@@ -2472,7 +3036,8 @@ class SystemTest {
   async testPlaceholderSchedulingGuard() {
     const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
     const agent = new PublishingSchedulingAgent({
-      saveScheduleEntry: async () => {}
+      saveScheduleEntry: async () => {},
+      getContentApproval: async () => ({ status: 'approved' })
     }, {});
 
     const simulated = await agent.scheduleContent({

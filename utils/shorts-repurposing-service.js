@@ -253,7 +253,7 @@ class ShortsRepurposingService {
     }
     const bundle = await this.requireSource(productionId);
     const clip = await this.requireClip(productionId, clipId);
-    if (bundle.review_status !== 'approved') {
+    if (bundle.approval?.status !== 'approved') {
       const error = new Error('Approve the source production before scheduling its Shorts');
       error.status = 409;
       throw error;
@@ -279,6 +279,7 @@ class ShortsRepurposingService {
       ? `${clip.description}\n\nWatch the full video: ${parentUrl}`.slice(0, 5000)
       : clip.description;
     const audio = bundle.assets?.audio || {};
+    const reviewedEvidence = { ...evidence, sourceContentRevision: bundle.contentRevision };
     const schedule = await this.publishing.scheduleContent({
       id: clip.id,
       script: { title: clip.title },
@@ -300,7 +301,7 @@ class ShortsRepurposingService {
       contentType: 'short',
       sourceProductionId: productionId,
       shortClipId: clip.id
-    });
+    }, { type: 'short', confirmed: true, sourceProductionId: productionId, clipId });
     if (!schedule) {
       const error = new Error('The Short could not be scheduled because its rendered media or narration evidence is incomplete');
       error.status = 409;
@@ -308,7 +309,7 @@ class ShortsRepurposingService {
     }
     return this.db.updateShortClip(clip.id, {
       status: 'scheduled', publishTime: publishTime.toISOString(), privacyStatus,
-      inheritedEvidence: evidence, approvedAt: new Date().toISOString(), scheduleId: schedule.id,
+      inheritedEvidence: reviewedEvidence, approvedAt: new Date().toISOString(), scheduleId: schedule.id,
       error: null
     });
   }

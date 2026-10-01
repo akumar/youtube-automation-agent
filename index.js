@@ -214,11 +214,15 @@ class YouTubeAutomationAgent {
 
   requireAPIKey() {
     return (req, res, next) => {
-      if (!process.env.API_KEY) {
-        return next();
+      const apiKey = process.env.API_KEY;
+      if (!apiKey || !apiKey.trim()) {
+        return res.status(503).json({
+          success: false,
+          error: 'API authentication is not configured'
+        });
       }
 
-      if (req.get('x-api-key') !== process.env.API_KEY) {
+      if (req.get('x-api-key') !== apiKey) {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
@@ -376,8 +380,8 @@ class YouTubeAutomationAgent {
     this.app.use(express.json({ limit: '1mb' }));
     this.app.use(express.static(path.join(__dirname, 'dashboard')));
 
-    if (!process.env.API_KEY) {
-      this.logger.warn('API_KEY is not set; mutating API routes are unprotected');
+    if (!process.env.API_KEY || !process.env.API_KEY.trim()) {
+      this.logger.warn('API_KEY is not set; mutating API routes will reject requests');
     }
     
     // Main dashboard route
@@ -456,7 +460,7 @@ class YouTubeAutomationAgent {
         const { contentId } = req.params;
         const bundle = await this.db.getProductionBundle(contentId);
         const short = bundle ? null : await this.db.getShortClip(contentId);
-        if ((!bundle || bundle.review_status !== 'approved') && (!short || !['scheduled', 'uploading', 'reconciliation_required'].includes(short.status))) {
+        if ((!bundle || bundle.approval?.status !== 'approved') && (!short || !['scheduled', 'uploading', 'reconciliation_required'].includes(short.status))) {
           return res.status(409).json({ success: false, error: 'Content must pass review and be approved before publishing' });
         }
         const result = await this.agents.publishing.publishContent(contentId);
@@ -584,6 +588,17 @@ class YouTubeAutomationAgent {
         bundle = await this.db.getProductionBundle(req.params.productionId);
       }
       return res.json(this.decorateContentBundle(bundle));
+    });
+
+    this.app.get('/api/content/:productionId/approval-history', protect, async (req, res) => {
+      try {
+        const bundle = await this.db.getProductionBundle(req.params.productionId);
+        if (!bundle) return res.status(404).json({ success: false, error: 'Content not found' });
+        const events = await this.db.getContentApprovalHistory(req.params.productionId);
+        return res.json({ success: true, result: { approval: bundle.approval, events } });
+      } catch (error) {
+        return res.status(error.status || 500).json({ success: false, error: error.message });
+      }
     });
 
     this.app.get('/api/content/:productionId/scenes/:sceneId/estimate', async (req, res) => {
@@ -771,12 +786,14 @@ class YouTubeAutomationAgent {
         }
         const editorData = this.validateEditorData(req.body, bundle.editorData);
         const result = await this.db.saveContentReview(bundle.id, {
-          status: bundle.review_status || 'needs_review',
+          status: 'needs_review',
           editorData,
           qualityChecks: bundle.qualityChecks,
           reviewNotes: req.body.reviewNotes ?? bundle.review_notes,
           reviewedAt: bundle.reviewed_at
         });
+        await this.db.invalidateContentApproval(bundle.id, req.body.reviewNotes ?? 'Draft edited; approval required again');
+        result.approval = await this.db.getContentApproval(bundle.id);
         return res.json({ success: true, result: this.decorateContentBundle(result) });
       } catch (error) {
         return res.status(400).json({ success: false, error: error.message });
@@ -801,6 +818,10 @@ class YouTubeAutomationAgent {
         qualityChecks: bundle.qualityChecks,
         reviewNotes: req.body?.notes || 'Rejected by operator',
         reviewedAt: new Date().toISOString()
+      });
+      await this.db.setContentApproval(bundle.id, {
+        status: 'rejected', reviewNotes: req.body?.notes || 'Rejected by operator',
+        reviewedBy: 'local-operator'
       });
       await this.db.updateProductionStatus(bundle.id, 'rejected');
       return res.json({ success: true });
@@ -992,7 +1013,6 @@ class YouTubeAutomationAgent {
       try {
         if (!this.agents.publishing) return res.status(503).json({ error: 'Publishing requires completed setup' });
         const result = await this.agents.publishing.rescheduleContent(req.params.productionId, req.body?.publishTime);
-        await this.db.updateProductionStatus(req.params.productionId, 'scheduled');
         return res.json({ success: true, result });
       } catch (error) {
         return res.status(error.status || 400).json({ success: false, error: error.message, code: error.code });
@@ -1003,7 +1023,6 @@ class YouTubeAutomationAgent {
       try {
         if (!this.agents.publishing) return res.status(503).json({ error: 'Publishing requires completed setup' });
         const result = await this.agents.publishing.emergencyPublish(req.params.productionId);
-        await this.db.updateProductionStatus(req.params.productionId, result.status);
         return res.json({ success: true, result });
       } catch (error) {
         return res.status(error.status || 400).json({ success: false, error: error.message, code: error.code });
@@ -1014,7 +1033,6 @@ class YouTubeAutomationAgent {
       try {
         if (!this.agents.publishing) return res.status(503).json({ error: 'Publishing requires completed setup' });
         const result = await this.agents.publishing.deleteScheduledContent(req.params.productionId);
-        await this.db.updateProductionStatus(req.params.productionId, 'approved');
         return res.json({ success: true, result });
       } catch (error) {
         return res.status(error.status || 400).json({ success: false, error: error.message, code: error.code });
@@ -1229,6 +1247,9 @@ class YouTubeAutomationAgent {
     });
 
     this.app.put('/api/settings', protect, async (req, res) => {
+      if (req.body?.approval_required !== undefined && String(req.body.approval_required).toLowerCase() !== 'true') {
+        return res.status(400).json({ error: 'Human approval is required for all generated content' });
+      }
       const allowed = ['approval_required', 'notification_enabled', 'channel_timezone', 'max_daily_posts', 'content_buffer_days'];
       for (const key of allowed) {
         if (req.body?.[key] !== undefined) await this.db.setSetting(key, String(req.body[key]));
@@ -1521,13 +1542,10 @@ class YouTubeAutomationAgent {
 
     // Step 6: Quality and approval gate
     return this.runGenerationStage(jobId, 'quality_review', 90, async () => {
-      const approvalRequired = await this.db.getSetting('approval_required') !== 'false';
-      const packagingExperiment = approvalRequired
-        ? await this.preparePackagingExperiment(thumbnail, productionData, seoData, script)
-        : null;
+      const packagingExperiment = await this.preparePackagingExperiment(thumbnail, productionData, seoData, script);
       const quality = await this.operator.runQualityChecks(productionData, profile);
       const reviewStatus = quality.passed
-        ? (approvalRequired ? 'needs_review' : 'approved')
+        ? 'needs_review'
         : 'needs_attention';
       await this.db.saveContentReview(contentId, {
         status: reviewStatus,
@@ -1538,23 +1556,17 @@ class YouTubeAutomationAgent {
           selectedThumbnailVariant: 0
         } : {},
         reviewNotes: quality.passed ? null : `Blocking checks failed: ${quality.blockingFailures.join(', ')}`,
-        reviewedAt: approvalRequired ? null : new Date().toISOString()
+        reviewedAt: null
       });
 
-      let scheduleEntry = null;
-      if (reviewStatus === 'approved') {
-        scheduleEntry = await this.agents.publishing.scheduleContent(productionData);
-        await this.db.updateProductionStatus(contentId, scheduleEntry ? 'scheduled' : productionData.status);
-      } else {
-        await this.db.updateProductionStatus(contentId, reviewStatus);
-        await this.operator.notify({
-          type: 'review_required',
-          level: quality.passed ? 'info' : 'warning',
-          title: quality.passed ? 'Content ready for review' : 'Content needs attention',
-          message: `${script.title} ${quality.passed ? 'is ready for approval' : 'failed one or more quality checks'}`,
-          data: { contentId, qualityScore: quality.score }
-        });
-      }
+      await this.db.updateProductionStatus(contentId, reviewStatus);
+      await this.operator.notify({
+        type: 'review_required',
+        level: quality.passed ? 'info' : 'warning',
+        title: quality.passed ? 'Content ready for review' : 'Content needs attention',
+        message: `${script.title} ${quality.passed ? 'is ready for approval' : 'failed one or more quality checks'}`,
+        data: { contentId, qualityScore: quality.score }
+      });
 
       return {
         contentId,
@@ -1562,7 +1574,7 @@ class YouTubeAutomationAgent {
         status: productionData.status,
         reviewStatus,
         qualityScore: quality.score,
-        scheduledFor: scheduleEntry ? scheduleEntry.publishTime : null
+        scheduledFor: null
       };
     });
   }
@@ -1715,13 +1727,16 @@ class YouTubeAutomationAgent {
       scheduledPublishTime: bundle.scheduled_publish_time
     }, profile);
     const status = quality.passed ? 'needs_review' : 'needs_attention';
-    return this.db.saveContentReview(productionId, {
+    const result = await this.db.saveContentReview(productionId, {
       status,
       editorData: { ...(bundle.editorData || {}), factChecked: false, rightsConfirmed: false },
       qualityChecks: quality.checks,
       reviewNotes: reviewNotes || (quality.passed ? null : `Blocking checks failed: ${quality.blockingFailures.join(', ')}`),
       reviewedAt: null
     });
+    await this.db.invalidateContentApproval(productionId, reviewNotes || 'Content changed; approval required again');
+    result.approval = await this.db.getContentApproval(productionId);
+    return result;
   }
 
   async approveContent(productionId, input) {
@@ -1778,49 +1793,40 @@ class YouTubeAutomationAgent {
         status: 'needs_attention', editorData, qualityChecks: quality.checks,
         reviewNotes: `Blocking checks failed: ${quality.blockingFailures.join(', ')}`
       });
+      await this.db.invalidateContentApproval(bundle.id, 'Quality checks failed; approval is pending');
       const error = new Error('Content still has blocking quality failures');
       error.status = 409;
       error.quality = quality;
       throw error;
     }
 
-    let scheduleEntry = bundle.schedule;
-    if (!scheduleEntry) {
-      scheduleEntry = await this.agents.publishing.scheduleContent(productionData);
-    } else if (scheduleEntry.status !== 'published') {
-      scheduleEntry.title = productionData.script.title;
-      scheduleEntry.publishTime = productionData.scheduledPublishTime;
-      scheduleEntry.status = 'scheduled';
-      scheduleEntry.metadata = {
-        ...scheduleEntry.metadata,
-        seo: productionData.seo,
-        thumbnail: productionData.assets.thumbnail,
-        video: productionData.assets.finalVideo,
-        audio: productionData.assets.audio,
-        captions: productionData.assets.captions,
-        privacyStatus: editorData.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
-        containsSyntheticMedia: productionData.containsSyntheticMedia
-      };
-      await this.db.updateScheduleEntry(scheduleEntry);
-      await this.agents.publishing.loadPublishQueue();
-    }
+    const existingSchedule = bundle.schedule?.status === 'published' ? null : bundle.schedule;
+    const scheduleEntry = await this.agents.publishing.prepareScheduleEntry(productionData, existingSchedule || {});
     if (!scheduleEntry) {
       const error = new Error('A real MP4 is required before content can be approved for scheduling');
       error.status = 409;
       throw error;
     }
 
-    await this.db.saveContentReview(bundle.id, {
-      status: 'approved', editorData, qualityChecks: quality.checks,
-      reviewNotes: input.reviewNotes || 'Approved by operator', reviewedAt: new Date().toISOString()
+    const persisted = await this.db.approveContentAndSchedule({
+      productionId: bundle.id,
+      expectedRevision: bundle.contentRevision,
+      review: {
+        editorData, qualityChecks: quality.checks,
+        reviewNotes: input.reviewNotes || 'Approved by operator', reviewedAt: new Date().toISOString()
+      },
+      scheduleEntry,
+      decision: {
+        reviewNotes: input.reviewNotes || 'Approved by operator', reviewedBy: 'local-operator'
+      }
     });
-    await this.db.updateProductionStatus(bundle.id, 'scheduled');
+    await this.agents.publishing.loadPublishQueue();
     await this.operator.notify({
       type: 'content_approved', level: 'success', title: 'Content approved',
-      message: `${productionData.script.title} is scheduled for ${scheduleEntry.publishTime}`,
-      data: { productionId, publishTime: scheduleEntry.publishTime }
+      message: `${productionData.script.title} is scheduled for ${persisted.scheduleEntry.publishTime}`,
+      data: { productionId, publishTime: persisted.scheduleEntry.publishTime }
     });
-    return { productionId, reviewStatus: 'approved', qualityScore: quality.score, schedule: scheduleEntry };
+    return { productionId, reviewStatus: 'approved', qualityScore: quality.score, schedule: persisted.scheduleEntry, approval: persisted.approval };
   }
 
   async start() {
