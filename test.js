@@ -2869,33 +2869,127 @@ class SystemTest {
 
   async testPublishingQueueSchedulingDisabled() {
     const cron = require('node-cron');
-    const originalSchedule = cron.schedule;
-    const scheduledExpressions = [];
+    const originalCreateTask = cron.createTask;
+    const registeredExpressions = [];
     const startedExpressions = [];
-    cron.schedule = (expression, callback, options) => {
+    const destroyedExpressions = [];
+    const stoppedExpressions = [];
+    const cleanupEvents = [];
+    let failRegistrationAt = null;
+    let failStartAt = null;
+    let failStopExpression = null;
+    let failDestroyExpression = null;
+    let startupError = null;
+    const mockCreateTask = (expression, callback) => {
+      registeredExpressions.push(expression);
+      if (failRegistrationAt === registeredExpressions.length) {
+        throw new Error('mock task registration failure');
+      }
       const task = {
-        expression, callback, options, running: false,
-        start() { this.running = true; startedExpressions.push(expression); },
-        stop() { this.running = false; }
+        expression, callback, running: false,
+        async start() {
+          startedExpressions.push(expression);
+          if (failStartAt === startedExpressions.length) throw startupError;
+          this.running = true;
+        },
+        async stop() {
+          stoppedExpressions.push(expression);
+          cleanupEvents.push(`stop:${expression}`);
+          this.running = false;
+          if (failStopExpression === expression) throw new Error(`mock stop failure: ${expression}`);
+        },
+        async destroy() {
+          destroyedExpressions.push(expression);
+          cleanupEvents.push(`destroy:${expression}`);
+          this.running = false;
+          if (failDestroyExpression === expression) throw new Error(`mock destroy failure: ${expression}`);
+        }
       };
-      scheduledExpressions.push(expression);
       return task;
     };
 
     try {
+      cron.createTask = mockCreateTask;
       const scheduler = new DailyAutomation({}, {});
       await scheduler.setupScheduledTasks();
+      const expectedExpressions = [
+        '0 6 * * *', '0 9 * * *', '0 8 * * 0', '0 22 * * *',
+        '0 3 * * 6', '0 */4 * * *', '30 */4 * * *'
+      ];
+      if (registeredExpressions.join('|') !== expectedExpressions.join('|')) {
+        throw new Error('The scheduler did not preserve all intended task registrations and expressions');
+      }
+      if (startedExpressions.length || [...scheduler.scheduledTasks.values()].some(task => task.running)) {
+        throw new Error('Registering scheduled tasks started them before explicit startup');
+      }
       if (scheduler.scheduledTasks.has('publish-queue-processing')) {
         throw new Error('A scheduled publishing queue task was registered');
       }
       if ([...scheduler.scheduledTasks.values()].some(task => !task || typeof task.start !== 'function')) {
         throw new Error('A scheduled task was registered without a task object');
       }
-      if (scheduledExpressions.includes('*/15 * * * *') || startedExpressions.includes('*/15 * * * *')) {
+      await scheduler.startScheduledTasks();
+      if (startedExpressions.join('|') !== expectedExpressions.join('|') ||
+        [...scheduler.scheduledTasks.values()].some(task => !task.running)) {
+        throw new Error('Explicit scheduler startup did not start all registered tasks');
+      }
+      if (registeredExpressions.includes('*/15 * * * *') || startedExpressions.includes('*/15 * * * *')) {
         throw new Error('The publishing queue task was scheduled or started');
       }
+
+      registeredExpressions.length = 0;
+      startedExpressions.length = 0;
+      destroyedExpressions.length = 0;
+      failRegistrationAt = 4;
+      const failedRegistration = new DailyAutomation({}, {});
+      let registrationRejected = false;
+      try { await failedRegistration.setupScheduledTasks(); } catch (_error) { registrationRejected = true; }
+      if (!registrationRejected || failedRegistration.scheduledTasks.size !== 0 || startedExpressions.length !== 0 ||
+        destroyedExpressions.length !== 3) {
+        throw new Error('A registration failure left tasks running, published, or undisposed');
+      }
+
+      registeredExpressions.length = 0;
+      destroyedExpressions.length = 0;
+      stoppedExpressions.length = 0;
+      cleanupEvents.length = 0;
+      failRegistrationAt = null;
+      failStartAt = 5;
+      startupError = new Error('mock task startup failure');
+      failStopExpression = expectedExpressions[3];
+      failDestroyExpression = expectedExpressions[2];
+      const failedStartup = new DailyAutomation({}, {});
+      await failedStartup.setupScheduledTasks();
+      let caughtStartupError = null;
+      try { await failedStartup.startScheduledTasks(); } catch (error) { caughtStartupError = error; }
+      const attemptedExpressions = expectedExpressions.slice(0, 5).reverse();
+      if (caughtStartupError !== startupError) {
+        throw new Error('Startup rollback did not preserve the original startup error');
+      }
+      if (attemptedExpressions.some(expression => !stoppedExpressions.includes(expression))) {
+        throw new Error('Startup rollback did not stop every attempted task');
+      }
+      if (attemptedExpressions.some(expression => !destroyedExpressions.includes(expression))) {
+        throw new Error('Startup rollback did not destroy every attempted task');
+      }
+      if ([...failedStartup.scheduledTasks.values()]
+        .filter(task => attemptedExpressions.includes(task.expression))
+        .some(task => task.running)) {
+        throw new Error('Startup rollback left an attempted task running');
+      }
+      const failedStopIndex = cleanupEvents.indexOf(`stop:${failStopExpression}`);
+      if (failedStopIndex === -1 || !cleanupEvents.slice(failedStopIndex + 1).includes(`destroy:${failStopExpression}`)) {
+        throw new Error('A stop failure prevented destroy from being attempted');
+      }
+      const failedDestroyIndex = cleanupEvents.indexOf(`destroy:${failDestroyExpression}`);
+      const cleanupContinued = attemptedExpressions.slice(3).every(expression =>
+        cleanupEvents.slice(failedDestroyIndex + 1).includes(`destroy:${expression}`)
+      );
+      if (failedDestroyIndex === -1 || !cleanupContinued) {
+        throw new Error('A destroy failure prevented cleanup of remaining tasks');
+      }
     } finally {
-      cron.schedule = originalSchedule;
+      cron.createTask = originalCreateTask;
     }
 
     this.logger.info('Publishing queue scheduling disabled test completed successfully');

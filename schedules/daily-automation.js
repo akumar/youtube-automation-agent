@@ -19,6 +19,7 @@ class DailyAutomation {
     this.logger.info('Initializing daily automation scheduler...');
     
     await this.setupScheduledTasks();
+    await this.startScheduledTasks();
     
     // Start monitoring loop
     this.startMonitoringLoop();
@@ -28,74 +29,93 @@ class DailyAutomation {
   }
 
   async setupScheduledTasks() {
-    // Daily content generation at 6:00 AM
-    this.scheduledTasks.set('daily-content-generation', 
-      cron.schedule('0 6 * * *', async () => {
+    const registeredTasks = new Map();
+    const registerTask = (name, expression, callback) => {
+      registeredTasks.set(name, cron.createTask(expression, callback));
+    };
+
+    try {
+      // Daily content generation at 6:00 AM
+      registerTask('daily-content-generation', '0 6 * * *', async () => {
         if (this.isEnabled) {
           await this.runDailyContentGeneration();
         }
-      }, { scheduled: false })
-    );
+      });
 
-    // Analytics collection at 9:00 AM daily
-    this.scheduledTasks.set('daily-analytics',
-      cron.schedule('0 9 * * *', async () => {
+      // Analytics collection at 9:00 AM daily
+      registerTask('daily-analytics', '0 9 * * *', async () => {
         if (this.isEnabled) {
           await this.collectDailyAnalytics();
         }
-      }, { scheduled: false })
-    );
+      });
 
-    // Weekly strategy review on Sundays at 8:00 AM
-    this.scheduledTasks.set('weekly-strategy-review',
-      cron.schedule('0 8 * * 0', async () => {
+      // Weekly strategy review on Sundays at 8:00 AM
+      registerTask('weekly-strategy-review', '0 8 * * 0', async () => {
         if (this.isEnabled) {
           await this.weeklyStrategyReview();
         }
-      }, { scheduled: false })
-    );
+      });
 
-    // Optimization tasks daily at 10:00 PM
-    this.scheduledTasks.set('daily-optimization',
-      cron.schedule('0 22 * * *', async () => {
+      // Optimization tasks daily at 10:00 PM
+      registerTask('daily-optimization', '0 22 * * *', async () => {
         if (this.isEnabled) {
           await this.runDailyOptimization();
         }
-      }, { scheduled: false })
-    );
+      });
 
-    // Database maintenance weekly on Saturdays at 3:00 AM
-    this.scheduledTasks.set('database-maintenance',
-      cron.schedule('0 3 * * 6', async () => {
+      // Database maintenance weekly on Saturdays at 3:00 AM
+      registerTask('database-maintenance', '0 3 * * 6', async () => {
         if (this.isEnabled) {
           await this.databaseMaintenance();
         }
-      }, { scheduled: false })
-    );
+      });
 
-    // Audience comment sync every 4 hours; the service's own taper decides which videos are due
-    this.scheduledTasks.set('audience-engagement-sync',
-      cron.schedule('0 */4 * * *', async () => {
+      // Audience comment sync every 4 hours; the service's own taper decides which videos are due
+      registerTask('audience-engagement-sync', '0 */4 * * *', async () => {
         if (this.isEnabled) {
           await this.collectAudienceEngagement();
         }
-      }, { scheduled: false })
-    );
+      });
 
-    // Collect controlled experiment evidence and advance only pre-approved arms.
-    this.scheduledTasks.set('growth-experiment-refresh',
-      cron.schedule('30 */4 * * *', async () => {
+      // Collect controlled experiment evidence and advance only pre-approved arms.
+      registerTask('growth-experiment-refresh', '30 */4 * * *', async () => {
         if (this.isEnabled) {
           await this.refreshGrowthExperiments();
         }
-      }, { scheduled: false })
-    );
+      });
+    } catch (error) {
+      await Promise.allSettled([...registeredTasks.values()].map(task => task.destroy()));
+      throw error;
+    }
 
-    // Start all scheduled tasks
-    this.scheduledTasks.forEach((task, name) => {
-      task.start();
-      this.logger.info(`Started scheduled task: ${name}`);
-    });
+    this.scheduledTasks = registeredTasks;
+    return this.scheduledTasks;
+  }
+
+  async startScheduledTasks() {
+    const startAttempts = [];
+    try {
+      for (const [name, task] of this.scheduledTasks) {
+        startAttempts.push(task);
+        await task.start();
+        this.logger.info(`Started scheduled task: ${name}`);
+      }
+    } catch (error) {
+      await Promise.allSettled(startAttempts.reverse().map(async task => {
+        try {
+          await task.stop();
+        } catch (_cleanupError) {
+          // Continue to destroy the task even if stopping it fails.
+        }
+
+        try {
+          await task.destroy();
+        } catch (_cleanupError) {
+          // Continue cleaning up the remaining tasks.
+        }
+      }));
+      throw error;
+    }
   }
 
   async runDailyContentGeneration() {
