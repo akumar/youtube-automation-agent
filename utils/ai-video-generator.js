@@ -5,7 +5,7 @@ const path = require('path');
 const axios = require('axios');
 const sharp = require('sharp');
 const { Logger } = require('./logger');
-const { runFFmpeg, checkFFmpeg, ffmpegInstallHint } = require('./ffmpeg');
+const { runFFmpeg, checkFFmpeg, ffmpegInstallHint, getMediaDuration } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
 
 class AIVideoGenerator {
@@ -508,11 +508,10 @@ class AIVideoGenerator {
       }
 
       const videoPath = outputPath.replace('.mp4', '_visual.mp4');
-      const duration = this.calculateScriptDuration(script);
+      const duration = await getMediaDuration(audioPath);
       await this.renderSlidesToVideo(stills, duration, videoPath);
 
-      // Add audio
-      await this.addAudioToVideo(videoPath, audioPath, outputPath);
+      await this.muxSlideshowToNarration(videoPath, audioPath, outputPath, duration);
 
       return outputPath;
     } finally {
@@ -527,7 +526,7 @@ class AIVideoGenerator {
     }
 
     const fade = 0.5;
-    const perSlide = Math.max(2, totalDuration / stills.length);
+    const perSlide = this.getSlideDuration(totalDuration, stills.length, fade);
 
     const args = ['-y'];
     for (const still of stills) {
@@ -561,6 +560,11 @@ class AIVideoGenerator {
 
     await runFFmpeg(args);
     return videoPath;
+  }
+
+  getSlideDuration(totalDuration, slideCount, fade = 0.5) {
+    if (slideCount <= 0) return 0;
+    return Math.max(2, (totalDuration + fade * (slideCount - 1)) / slideCount);
   }
 
   async filterImageAssets(visualAssets = []) {
@@ -812,6 +816,15 @@ class AIVideoGenerator {
     return Math.max(30, Math.ceil((totalWords / 150) * 60));
   }
 
+  async muxSlideshowToNarration(videoPath, audioPath, outputPath, audioDurationSeconds) {
+    const targetDuration = this.parseDurationSeconds(audioDurationSeconds) || await getMediaDuration(audioPath);
+    if (!targetDuration) throw new Error('Could not determine narration duration to bound slideshow mux output');
+    return this.addAudioToVideo(videoPath, audioPath, outputPath, {
+      loopVideo: true,
+      audioDurationSeconds: targetDuration
+    });
+  }
+
   async addAudioToVideo(videoPath, audioPath, outputPath, options = {}) {
     const hasRealAudio = await this.isUsableAudioFile(audioPath);
 
@@ -832,7 +845,14 @@ class AIVideoGenerator {
       : outputPath;
 
     const videoInput = options.loopVideo ? ['-stream_loop', '-1', '-i', videoPath] : ['-i', videoPath];
-    await runFFmpeg(['-y', ...videoInput, '-i', audioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-shortest', muxPath]);
+    const args = ['-y', ...videoInput, '-i', audioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-shortest'];
+    if (options.loopVideo && options.audioDurationSeconds !== undefined) {
+      const targetDuration = this.parseDurationSeconds(options.audioDurationSeconds);
+      if (!targetDuration) throw new Error('Invalid narration duration supplied to slideshow mux');
+      args.push('-t', targetDuration.toFixed(3));
+    }
+    args.push(muxPath);
+    await runFFmpeg(args);
 
     if (muxPath !== outputPath) {
       await fs.rename(muxPath, outputPath);
