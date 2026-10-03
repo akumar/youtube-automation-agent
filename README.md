@@ -6,7 +6,7 @@ Research topics → write scripts → generate narration and visuals → assembl
 
 [![CI](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node.js 18+](https://img.shields.io/badge/node-18%2B-43853d.svg)](package.json)
+[![Node.js 20.17+](https://img.shields.io/badge/node-20.17%2B-43853d.svg)](package.json)
 
 ## What's new on master
 
@@ -123,7 +123,7 @@ The optional external adapter uses a shell-free Python child process, sends cont
 
 ### What you need
 
-- Node.js 18+
+- Node.js 20.17.0 or newer
 - A Google account and YouTube Data API credentials
 - At least one AI text provider key
 - FFmpeg, installed automatically through `ffmpeg-static`
