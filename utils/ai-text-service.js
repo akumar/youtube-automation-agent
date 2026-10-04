@@ -63,13 +63,15 @@ class AITextService {
     const model = credentials.aiProvider?.model;
 
     if (provider && PROVIDERS[provider] && apiKey) {
-      return this._initOpenAICompatible(PROVIDERS[provider], apiKey, model);
+      const selectedModel = provider === 'openrouter' ? process.env.OPENROUTER_MODEL || model : model;
+      return this._initOpenAICompatible(PROVIDERS[provider], apiKey, selectedModel);
     }
 
     for (const [, preset] of Object.entries(PROVIDERS)) {
       const key = process.env[preset.envKey];
       if (key) {
-        return this._initOpenAICompatible(preset, key);
+        const model = preset === PROVIDERS.openrouter ? process.env.OPENROUTER_MODEL : undefined;
+        return this._initOpenAICompatible(preset, key, model);
       }
     }
 
@@ -139,6 +141,7 @@ class AITextService {
         ...params,
         max_completion_tokens: maxTokens,
       });
+      this._logOpenRouterResponseDiagnostics(response, model);
       return this._extractContent(response);
     } catch (error) {
       // Older models and some providers reject max_completion_tokens with a 400;
@@ -152,10 +155,32 @@ class AITextService {
           ...params,
           max_tokens: maxTokens,
         });
+        this._logOpenRouterResponseDiagnostics(response, model);
         return this._extractContent(response);
       }
       throw error;
     }
+  }
+
+  _logOpenRouterResponseDiagnostics(response, model) {
+    if (this.providerName !== PROVIDERS.openrouter.name) return;
+
+    const choices = Array.isArray(response?.choices) ? response.choices : [];
+    const message = choices[0]?.message;
+    const content = message?.content;
+    const refusal = message?.refusal;
+
+    this.logger.info('OpenRouter response diagnostics', {
+      provider: this.providerName,
+      model,
+      choicesCount: choices.length,
+      messageType: message === null ? 'null' : typeof message,
+      contentType: content === null ? 'null' : typeof content,
+      contentLength: typeof content === 'string' || Array.isArray(content) ? content.length : null,
+      finishReason: choices[0]?.finish_reason ?? null,
+      refusalPresent: refusal !== undefined && refusal !== null,
+      refusalType: refusal === null ? 'null' : typeof refusal,
+    });
   }
 
   _extractContent(response) {

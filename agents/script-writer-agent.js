@@ -107,7 +107,7 @@ class ScriptWriterAgent {
     }
 
     const prompt = `You are writing a YouTube script plan.
-Return only valid JSON with this exact shape:
+Return ONLY the JSON object with this exact shape. Do not include safety labels, preambles, explanations, commentary, or Markdown fences.
 {
   "title": "compelling title under 100 characters",
   "hook": "opening hook in one sentence",
@@ -137,15 +137,46 @@ Keywords: ${(strategy.keywords || []).join(', ')}
 Research sources: ${JSON.stringify(strategy.researchSources || [])}
 Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.`;
 
+    const requestOptions = { maxTokens: 1800, temperature: 0.7 };
+    let parsed;
     try {
-      const response = await this.aiTextService.generateText(prompt, {
-        maxTokens: 1800,
-        temperature: 0.7
-      });
-      const parsed = this.parseAIJsonResponse(response);
+      let response;
+      try {
+        response = await this.aiTextService.generateText(prompt, requestOptions);
+      } catch (error) {
+        if (!/returned an empty response/i.test(error.message || '')) throw error;
+      }
+      if (response !== undefined) {
+        try {
+          parsed = this.parseAIJsonResponse(response);
+        } catch (error) {
+          if (error.code !== 'SCRIPT_RESPONSE_NO_JSON_OBJECT') throw error;
+        }
+      }
+
+      if (!parsed) {
+        this.logger.warn('AI script response was empty or contained no parseable JSON object; retrying once');
+        const retryPrompt = `${prompt}\n\nReturn ONLY one valid JSON object matching the required schema above. Include no safety labels, commentary, Markdown, or prose before or after the JSON object.`;
+        const retryResponse = await this.aiTextService.generateText(retryPrompt, requestOptions);
+        parsed = this.parseAIJsonResponse(retryResponse);
+      }
+    } catch (error) {
+      this.logger.warn(`AI script generation failed; using template fallback: ${error.message}`);
+      return null;
+    }
+
+    try {
       const sections = this.normalizeAISections(parsed.sections, strategy);
 
       if (!parsed.title || !parsed.hook || sections.length === 0) {
+        this.logger.warn('AI script response failed required-field validation', {
+          hasTitle: Boolean(parsed.title),
+          hasHook: Boolean(parsed.hook),
+          sectionCount: sections.length,
+          sectionsWithSpokenContent: sections.filter(section => section.content.length > 0).length,
+          hasCTA: Boolean(parsed.cta),
+          claimsType: Array.isArray(parsed.claims) ? 'array' : typeof parsed.claims,
+        });
         throw new Error('AI script response missing required fields');
       }
 
@@ -186,14 +217,41 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
       .trim();
 
     try {
-      return JSON.parse(withoutFences);
-    } catch (error) {
-      const match = withoutFences.match(/\{[\s\S]*\}/);
-      if (!match) {
-        throw error;
-      }
-      return JSON.parse(match[0]);
+      const parsed = JSON.parse(withoutFences);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch (_) {
+      // Try a JSON object embedded in a short provider prefix or suffix.
     }
+
+    const start = withoutFences.indexOf('{');
+    if (start !== -1) {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let index = start; index < withoutFences.length; index++) {
+        const character = withoutFences[index];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (character === '\\') escaped = true;
+          else if (character === '"') inString = false;
+          continue;
+        }
+        if (character === '"') inString = true;
+        else if (character === '{') depth++;
+        else if (character === '}' && --depth === 0) {
+          try {
+            const parsed = JSON.parse(withoutFences.slice(start, index + 1));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+          } catch (_) {
+            break;
+          }
+        }
+      }
+    }
+
+    const error = new Error('AI script response does not contain a valid JSON object');
+    error.code = 'SCRIPT_RESPONSE_NO_JSON_OBJECT';
+    throw error;
   }
 
   normalizeAIHook(hook) {
