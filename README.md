@@ -1,34 +1,18 @@
-# AgentTube - ECGHuNZSECqTXabaLjkVrTEnguiNZLkKF1qi8oBGpump
+# YouTube Automation Agent
 
-**The open-source AI agent that runs a YouTube channel end to end.**
+**An open-source agent for researching, generating, and reviewing YouTube video drafts.**
 
-Research topics → write scripts → generate narration and visuals → assemble videos → optimize metadata → review → schedule → publish → learn from analytics and from what your audience says.
+Research topics → write scripts → generate narration and visuals → assemble draft videos → optimize metadata → review locally. YouTube scheduling and uploads remain disabled in this implementation.
 
-[![CI](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/akumar/youtube-automation-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/akumar/youtube-automation-agent/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js 20.17+](https://img.shields.io/badge/node-20.17%2B-43853d.svg)](package.json)
 
-## What's new on master
+Historical changes are recorded in [`124a1ed`](https://github.com/akumar/youtube-automation-agent/commit/124a1ed18e474878d5829812dd632e579adbd860) and [`d52b40d`](https://github.com/akumar/youtube-automation-agent/commit/d52b40d94a007caf5e7f256378c0265ddcf09d2b). See [CHANGELOG.md](CHANGELOG.md) for release history. Run the test suite with `npm test`.
 
-- **v2.10.0 is now on master:** DarkzSEO discoverability audits, controlled growth experiments, and outcome-aware channel operation are available together in the approval-first workflow.
+## Discoverability and channel-learning features
 
-### September 21, 2026 reliability hotfixes
-
-The latest production fixes are included in [`124a1ed`](https://github.com/darkzOGx/youtube-automation-agent/commit/124a1ed18e474878d5829812dd632e579adbd860) and [`d52b40d`](https://github.com/darkzOGx/youtube-automation-agent/commit/d52b40d94a007caf5e7f256378c0265ddcf09d2b):
-
-- **DarkzSEO works without Python:** the bundled advisory audit is now the default. AgentTube no longer auto-selects sibling Python checkouts, and a missing or broken explicitly configured external runtime falls back to the bundled audit instead of reporting `No module named darkzseo`.
-- **Narration repairs keep correct timing:** regenerated narration updates the scene duration from the replacement audio, preventing stale timing and long silent gaps after a rebuild.
-- **Cleaner spoken narration:** internal CTA metadata and bracketed placeholders are excluded from speech, including placeholders that appear in the middle of a line.
-- **Configured visual styles are respected:** scene generation and repair prompts no longer force the `ethereal` style when the channel uses another visual direction.
-- **Complete scheduling controls:** Review Studio can reschedule a production, publish it now, or delete its schedule without deleting the generated content. Immediate uploads also use the correct YouTube publishing metadata.
-- **Reliable desktop YouTube authorization:** OAuth uses the exact dynamically selected loopback address and port, while legacy hardcoded callback settings are normalized automatically.
-- **Null-safe content generation:** a missing `strategyContext` no longer crashes content generation while reading its angle or keywords.
-
-These paths are covered by the 46-test system suite. Existing safety gates still block simulated video, missing narration, unresolved factual claims, and unconfirmed media rights from publishing.
-
-## What's new in v2.10.0
-
-**AgentTube now has a discoverability adapter layer.** v2.10.0 connects the production pipeline to DarkzSEO without merging the projects or weakening human review, then adds the evidence needed to prove what packaging and strategy actually work:
+The project has a discoverability adapter layer that integrates with the separate [DarkzSEO project](https://github.com/darkzOGx/darkzseo) without merging the projects or weakening human review. It also records evidence used to evaluate packaging and channel strategy:
 
 - **DarkzSEO Discoverability Preflight:** send a canonical content package—not the private dashboard—through versioned GEO, AIO, AEO, and web-search checks after metadata and provenance are assembled.
 - **Reviewable evidence:** persist stable rule IDs, severity, engine/schema identity, fingerprints, and operator decisions in SQLite. Keep a finding actionable or dismiss a false positive with a reason that carries into matching future audits.
@@ -37,12 +21,12 @@ These paths are covered by the 46-test system suite. Existing safety gates still
 - **Outcome & ROI Studio:** align the operator with a measurable KPI, target window, budget, and available revenue/cost evidence without converting missing economics into false zeroes.
 - **Platform-ready foundation:** audits already retain their target platform, providing the durable contract for planned TikTok and Instagram/Reels publishing and analytics adapters.
 
-The content preflight works out of the box. Set `DARKZSEO_PATH` only when developing against a separate DarkzSEO 1.4+ checkout. If that optional external runtime is missing or broken, AgentTube automatically uses the bundled audit.
+The content preflight works out of the box. Set `DARKZSEO_PATH` only when developing against a separate DarkzSEO 1.4+ checkout. If that optional external runtime is missing or broken, the bundled audit is used. DarkzSEO is a separate project and does not maintain this repository.
 
 See the complete release history in [CHANGELOG.md](CHANGELOG.md).
 
 - **Self-hosted:** your credentials, media, and channel data stay under your control.
-- **Approval-first:** nothing is scheduled until quality, rights, and human-review gates pass by default.
+- **Local review:** quality and rights checks support local review and approval; approval does not create a YouTube schedule.
 - **Strategy-driven:** give the Autonomous Channel Operator an objective, audience, pillars, cadence, and guardrails; it turns them into researched content plans and production runs.
 - **Provider-flexible:** use Gemini, OpenAI, OpenRouter, Kimi, MiMo, GLM, or another OpenAI-compatible text endpoint, plus Seedance, MiniMax H3, Gemini Omni Flash, Kling, Wan, or local FFmpeg for video.
 - **Observable:** follow persistent generation jobs, failures, review state, publishing, and local activation milestones from the dashboard.
@@ -52,16 +36,34 @@ See the complete release history in [CHANGELOG.md](CHANGELOG.md).
 ## Quick start
 
 ```bash
-git clone https://github.com/darkzOGx/youtube-automation-agent.git
+git clone https://github.com/akumar/youtube-automation-agent.git
 cd youtube-automation-agent
 npm install
-npm run walkthrough
-npm start
 ```
 
-Open `http://localhost:3456`. The walkthrough explains each provider choice, tests credentials, and guides YouTube authorization.
+Choose one of the workflows below, configure it, then start with `npm start`.
 
-Already know what you are doing? `npm run setup` offers a shorter classic flow, and `.env.example` documents every setting.
+### Local draft-only mode
+
+Draft-only mode lets you generate content and review or approve it locally without YouTube credentials. Approval is stored locally and does not create a YouTube publishing schedule. Scheduling, publishing, and uploads remain disabled. A configured AI provider is still needed for real AI-generated text or narration; provider requests go to that provider.
+
+Create a `.env` file with an AI provider key and these settings, for example:
+
+```env
+YOUTUBE_AUTOMATION_DRAFT_ONLY=true
+YOUTUBE_AUTOMATION_DB_PATH=./data/draft-only.db
+VIDEO_PROVIDER=slideshow
+GEMINI_API_KEY=your-gemini-api-key
+PORT=3456
+```
+
+Then run `npm start` and open `http://localhost:3456`. The local slideshow uses locally rendered slides and FFmpeg assembly; Gemini can provide text and narration. No YouTube API credentials are needed in this mode.
+
+### Production / YouTube mode
+
+For YouTube-connected research and analytics, leave `YOUTUBE_AUTOMATION_DRAFT_ONLY` unset or set it to `false`, configure an AI text provider, and complete `npm run walkthrough` with YouTube Data API OAuth credentials. These credentials support the production integration; credentials alone do not enable publishing. This repository currently keeps YouTube scheduling and uploads disabled, including after approval. The review and approval gates still apply.
+
+`npm run setup` offers a shorter setup flow, and `.env.example` documents the available settings.
 
 ### Verify production readiness
 
@@ -69,7 +71,7 @@ Before activating autonomous production, open **Production readiness** in the da
 
 AI image generation can incur a larger provider charge, so its live probe is a separate opt-in checkbox. Without that checkbox, image configuration is reported as verified, skipped, or using the built-in gradient fallback without making a paid image request.
 
-AI video verification has its own **Include paid video probe** checkbox. When enabled, Lumen creates the provider's shortest supported test clip, records the external task and model, downloads and decodes the MP4, then removes the temporary asset. It never silently tries a second paid provider.
+AI video verification has its own **Include paid video probe** checkbox. When enabled, YouTube Automation Agent creates the provider's shortest supported test clip, records the external task and model, downloads and decodes the MP4, then removes the temporary asset. It never silently tries a second paid provider.
 
 Results persist locally in SQLite with exact remediation steps. A recorded blocking failure stops autonomous generation and publishing until a later run passes; manual work remains available when readiness has never been checked or the last result is older than 24 hours.
 
@@ -77,7 +79,7 @@ Results persist locally in SQLite with exact remediation steps. A recorded block
 
 Every generation stage writes a local SQLite checkpoint. If a provider times out or the application restarts, the dashboard shows the saved-stage count and the first incomplete stage. Choose **Resume** to continue from there, or select an earlier stage when you intentionally want to regenerate that stage and everything after it. Saved files are validated before reuse; missing artifacts are regenerated automatically.
 
-Autonomous Operator runs preserve their research and editorial plan, so **Resume run** continues unfinished plan items instead of researching and generating completed videos again. Publishing remains fail-closed: if an upload may have reached YouTube but no video ID was returned, Lumen requires channel reconciliation before another upload attempt.
+Autonomous Operator runs preserve their research and editorial plan, so **Resume run** continues unfinished plan items instead of researching and generating completed videos again. Publishing remains fail-closed: if an upload may have reached YouTube but no video ID was returned, YouTube Automation Agent requires channel reconciliation before another upload attempt.
 
 ### Repair one scene without starting over
 
@@ -85,7 +87,7 @@ Every production now keeps a durable scene manifest with its narration, visual p
 
 Paid video regeneration always shows the provider and generated seconds and requires a separate confirmation. Uploaded assets require an explicit rights confirmation. Narration edits invalidate that scene's audio and factual review; live narration must be regenerated and any new factual claim must be reviewed against verified evidence before approval.
 
-Narration is fail-closed. AgentTube records the TTS provider, model, external task when available, generation time, cost evidence, and failure reason for every scene. If narration is missing, simulated, stale, or failed, the production cannot be approved, scheduled, or published. Use **Regenerate narration only** to repair the audio without spending video-generation credits or replacing a visual.
+Narration is fail-closed. YouTube Automation Agent records the TTS provider, model, external task when available, generation time, cost evidence, and failure reason for every scene. If narration is missing, simulated, stale, or failed, the production cannot be approved, scheduled, or published. Use **Regenerate narration only** to repair the audio without spending video-generation credits or replacing a visual.
 
 An intentionally silent production requires a separate operator confirmation and a stored reason of at least 10 characters. The override remains visible in Review Studio, can be reversed, and is included in the narration revision history. Silence is never inferred from a failed provider call.
 
@@ -93,19 +95,19 @@ When the timeline is ready, **Rebuild final video** creates a new MP4 and scene-
 
 ### Repurpose an approved video into Shorts
 
-Open **Shorts Repurposing Studio** inside Review Studio and choose **Create 3 Short drafts**. AgentTube selects self-contained windows from the durable scene timeline and preserves the exact source-scene IDs, start time, duration, rationale, title, description, tags, layout, and inherited review evidence for each candidate. Draft selection is local and does not call an AI provider.
+Open **Shorts Repurposing Studio** inside Review Studio and choose **Create 3 Short drafts**. YouTube Automation Agent selects self-contained windows from the durable scene timeline and preserves the exact source-scene IDs, start time, duration, rationale, title, description, tags, layout, and inherited review evidence for each candidate. Draft selection is local and does not call an AI provider.
 
 Choose a blurred-canvas, center-crop, or stacked-focus layout, then render a real 9:16 MP4 with mobile-safe burned captions and a separate SRT file. The source video and narration are reused, so the default workflow does not spend new image, video, or TTS credits. Changing the layout invalidates the prior render and requires a fresh local render.
 
-Every Short has its own approval and schedule. Scheduling remains blocked until the source production is approved, provenance is resolved, uploaded media rights are confirmed, every source scene is current, and the operator explicitly confirms the Short's privacy and publish time. Published Shorts retain their parent-production identity while their analytics use a separate Shorts baseline.
+Each Short has its own local draft and review record, which may include recommended or stored publish metadata. In draft-only mode, approval records local review state only; it does not create an actual YouTube publication schedule. YouTube publishing and uploads remain disabled in this implementation.
 
 ### Review research and provenance
 
 Every production has an **Evidence desk** inside Review Studio. Autonomous research carries exact YouTube source metadata into the production, while AI-generated scripts list the factual claims that need review. Add any official articles, datasets, asset licenses, or other evidence that the script needs, verify each source, and connect it to the claims it supports.
 
-A claim can be approved only when it links to a verified source. Unsupported claims remain blocking, and an intentional waiver requires a reviewer note. Productions with no externally verifiable factual claims are marked as not requiring provenance review. The separate factual-review and media-rights attestations remain required before scheduling.
+A claim can be approved only when it links to a verified source. Unsupported claims remain blocking, and an intentional waiver requires a reviewer note. Productions with no externally verifiable factual claims are marked as not requiring provenance review. Factual-review and media-rights attestations are stored with review state; YouTube scheduling remains disabled.
 
-Use the altered or synthetic media control only when the video contains realistic content that requires YouTube disclosure. The selected value is preserved in the publishing queue and included in the YouTube upload request.
+Use the altered or synthetic media control only when the video contains realistic content that requires YouTube disclosure. The production integration prepares this value as upload metadata, but actual YouTube uploads remain disabled by the current draft-only and publishing safeguards.
 
 ### Review discoverability guidance
 
@@ -119,76 +121,76 @@ To test a separate DarkzSEO 1.4+ checkout instead of the bundled auditor:
 DARKZSEO_PATH=../darkzseo/darkzseo.py npm start
 ```
 
-The optional external adapter uses a shell-free Python child process, sends content JSON over stdin, and reads JSON-only stdout. The public PyPI `darkzseo` 1.3.3 package has a different site-audit CLI and is not used by AgentTube.
+The optional external adapter uses a shell-free Python child process, sends content JSON over stdin, and reads JSON-only stdout. The public PyPI `darkzseo` 1.3.3 package has a different site-audit CLI and is not used by this application.
 
 ### What you need
 
 - Node.js 20.17.0 or newer
-- A Google account and YouTube Data API credentials
+- A Google account and YouTube Data API credentials for production/YouTube mode; these are not needed for local draft-only generation
 - At least one AI text provider key
 - FFmpeg, installed automatically through `ffmpeg-static`
 - Python 3.9+ only when explicitly testing an external DarkzSEO checkout
 
-Gemini offers free access for supported text and TTS usage. Gemini AI image generation currently requires paid-tier access; without an image provider, Lumen can assemble gradient-based visuals instead.
+Gemini pricing and free-tier availability vary by model and modality. In local slideshow mode, visuals are rendered locally and image-generation APIs are not called. Selecting a separate image or video provider can incur provider charges.
 
 ### Run the Autonomous Channel Operator
 
 Open **Autonomous operator** in the dashboard and describe the channel outcome—not a task list. Set the objective, audience, content pillars, publishing cadence, success metric, and boundaries, then choose **Activate & run now**.
 
-Lumen refreshes YouTube trend and configured-competitor signals, checks recent channel topics, creates an evidence-labeled editorial plan, and sends each planned video through strategy, script, thumbnail, SEO, production, and workflow management. Active strategies also guide scheduled generation at the requested weekly cadence. Operator runs, decisions, progress, and failures persist in SQLite and remain visible in the dashboard.
+YouTube Automation Agent refreshes YouTube trend and configured-competitor signals, checks recent channel topics, creates an evidence-labeled editorial plan, and sends each planned video through strategy, script, thumbnail, SEO, production, and workflow management. Active strategies also guide scheduled generation at the requested weekly cadence. Operator runs, decisions, progress, and failures persist in SQLite and remain visible in the dashboard.
 
-By default, finished videos wait for factual review, media-rights confirmation, and approval. Once approved, the existing publishing agent schedules and uploads them. Turning on autonomy does not bypass those gates, and simulated videos still cannot publish.
+Finished videos wait for factual review, media-rights confirmation, and local approval. Approval does not schedule a YouTube publication; publishing/upload remain disabled in this implementation.
 
 ### Close the performance loop
 
-After publication, Lumen captures comparable 24-hour and 7-day performance snapshots. It evaluates CTR, retention, engagement, watch time, format, length, hook style, and title style against the channel's own history—not a universal view-count target.
+After publication, YouTube Automation Agent captures comparable 24-hour and 7-day performance snapshots. It evaluates CTR, retention, engagement, watch time, format, length, hook style, and title style against the channel's own history—not a universal view-count target.
 
 Open **Analytics → What the agent learned** to review the evidence and confidence behind each recommendation. Pending or rejected recommendations never influence generation. Once you approve one, the next Autonomous Channel Operator run includes it as an explicit planning constraint. Simulated analytics fallbacks are stored as unverified and are never eligible for baselines or recommendations.
 
-When an approved learning calls for better packaging, Lumen prepares a control plus title and thumbnail variants for new videos. Review Studio shows those options before approval; the selected combination is the only one handed to the publishing queue. Lumen does not silently swap live YouTube metadata.
+When an approved learning calls for better packaging, YouTube Automation Agent prepares a control plus title and thumbnail variants for new videos. Review Studio shows those options during review. The publishing queue task is intentionally not registered, so approved content remains available for review and production without automatic queue processing. YouTube Automation Agent does not silently swap live YouTube metadata.
 
 ### Prove a growth recommendation
 
 Open **Analytics → Controlled Growth Experiments** after a video with approved-learning packaging variants is published. Create a draft plan with a 24–168 hour window per arm and a minimum-impressions threshold, review the exact title and thumbnail combinations, then separately approve and start the live test.
 
-Lumen records a cumulative analytics sample before and after each arm and evaluates only the interval delta. Every arm must reach the configured impression and click floor. The leading CTR must clear a 95% evidence threshold without a material retention regression or traffic-source shift; otherwise the result is explicitly **inconclusive**. Simulated analytics never advance an experiment.
+YouTube Automation Agent records a cumulative analytics sample before and after each arm and evaluates only the interval delta. Every arm must reach the configured impression and click floor. The leading CTR must clear a 95% evidence threshold without a material retention regression or traffic-source shift; otherwise the result is explicitly **inconclusive**. Simulated analytics never advance an experiment.
 
-Arm rotations are limited to the plan you approved. After the final arm, Lumen restores the control title and thumbnail before presenting the result. Applying the winner is a separate confirmation; only then does the validated packaging pattern become an approved learning for future Autonomous Operator runs. Experiment state and evidence are stored in SQLite so restarts do not erase progress.
+Arm rotations are limited to the plan you approved. After the final arm, YouTube Automation Agent restores the control title and thumbnail before presenting the result. Applying the winner is a separate confirmation; only then does the validated packaging pattern become an approved learning for future Autonomous Operator runs. Experiment state and evidence are stored in SQLite so restarts do not erase progress.
 
 ### Align the channel with outcomes and ROI
 
 The Autonomous Operator strategy can define a measurable primary outcome—views, watch hours, net subscribers, engagement rate, or estimated revenue—plus a numeric target, evidence window, monthly production budget, and currency. The existing free-text outcome context remains available for goals that need human nuance.
 
-At each real analytics window, Lumen stores subscriber gains and losses, watch hours, monetization evidence when the channel exposes it, and known production costs from durable scene records. **Analytics → Outcome & ROI Studio** shows target progress, evidence coverage, net subscribers, estimated revenue, known cost, ROI, and comparisons by content pillar, format, and production provider.
+At each real analytics window, YouTube Automation Agent stores subscriber gains and losses, watch hours, monetization evidence when the channel exposes it, and known production costs from durable scene records. **Analytics → Outcome & ROI Studio** shows target progress, evidence coverage, net subscribers, estimated revenue, known cost, ROI, and comparisons by content pillar, format, and production provider.
 
-Missing evidence is explicit. A channel without monetization access shows revenue as unavailable rather than zero, and ROI stays unavailable until both revenue and complete cost evidence exist. When at least two comparable videos exist in each group, the learning engine can propose reallocating future content toward the pillar or format that best advances the configured outcome. That proposal remains pending until you approve it; Lumen never changes the strategy or budget silently.
+Missing evidence is explicit. A channel without monetization access shows revenue as unavailable rather than zero, and ROI stays unavailable until both revenue and complete cost evidence exist. When at least two comparable videos exist in each group, the learning engine can propose reallocating future content toward the pillar or format that best advances the configured outcome. That proposal remains pending until you approve it; YouTube Automation Agent never changes the strategy or budget silently.
 
 ### Find the exact scene that lost viewers
 
-At each real analytics window, AgentTube also requests YouTube's audience-retention curve and maps its 100 elapsed-time points onto the stored scene durations. Open **Analytics → Scene-aware retention** to see the curve divided by scene, compare absolute and relative retention, and inspect drop-off, rewatch, strong-hold, or steady signals for each beat.
+At each real analytics window, YouTube Automation Agent also requests YouTube's audience-retention curve and maps its 100 elapsed-time points onto the stored scene durations. Open **Analytics → Scene-aware retention** to see the curve divided by scene, compare absolute and relative retention, and inspect drop-off, rewatch, strong-hold, or steady signals for each beat.
 
-Retention snapshots are stored separately for long-form videos and Shorts. Missing, sparse, or simulated curves never enter this evidence layer. A scene finding creates a pending learning recommendation; it cannot guide future scripts, pacing, or scene structure until the operator approves it, and AgentTube never rewrites a published video. Use **Refresh curve** for a read-only update from YouTube Analytics, or `GET /api/retention/:videoId` to inspect stored evidence.
+Retention snapshots are stored separately for long-form videos and Shorts. Missing, sparse, or simulated curves never enter this evidence layer. A scene finding creates a pending learning recommendation; it cannot guide future scripts, pacing, or scene structure until the operator approves it, and YouTube Automation Agent never rewrites a published video. Use **Refresh curve** for a read-only update from YouTube Analytics, or `GET /api/retention/:videoId` to inspect stored evidence.
 
 ### Engage with your audience
 
-Open **Engagement** in the dashboard. AgentTube syncs comments for recently published videos every four hours (more often for fresh videos) and classifies them into themes, sentiment, and questions. Likely spam, scams, and toxic comments are quarantined into a separate needs-attention list — AgentTube never deletes or hides a comment; acting on flagged comments stays in YouTube Studio.
+Open **Engagement** in the dashboard. YouTube Automation Agent syncs comments for recently published videos every four hours (more often for fresh videos) and classifies them into themes, sentiment, and questions. Likely spam, scams, and toxic comments are quarantined into a separate needs-attention list — YouTube Automation Agent never deletes or hides a comment; acting on flagged comments stays in YouTube Studio.
 
 Choose **Draft replies** to generate suggested answers in your channel's voice. Nothing posts automatically: every reply waits in the queue where you can edit, discard, or approve it, and approval requires an explicit confirmation. Posting requires re-authorizing YouTube once to grant the comment permission (`youtube.force-ssl`); until then the studio works in read-and-draft mode. A daily posting cap (default 50, `ENGAGEMENT_DAILY_REPLY_CAP`) keeps approval sessions bounded.
 
 When three or more commenters ask for the same thing, the analysis mines an **audience-requested idea** with comment permalinks as evidence. Like every other learning, it stays pending until you approve it — only then can the Autonomous Channel Operator plan a video that answers it. If no AI text provider is configured, comment sync still works, but the studio records only mechanical facts and never invents themes, drafts, or ideas.
 
-## From idea to published video
+## From idea to reviewed draft
 
-| Stage | What Lumen does | What you control |
+| Stage | What YouTube Automation Agent does | What you control |
 | --- | --- | --- |
 | Research | Finds topics and builds a content strategy | Niche, audience, blocked topics |
 | Script | Writes the hook, narrative, CTA, and metadata | Voice, format, length, brand direction |
 | Production | Generates narration and visuals, then assembles a real MP4 | Provider choice and media fallbacks |
 | Review | Runs quality checks and opens the video in Review Studio | Facts, media rights, edits, approval |
-| Publish | Schedules and uploads approved content | Privacy, timing, final decision |
+| Publish | Disabled in the current implementation | YouTube scheduling and upload are unavailable |
 | Learn | Captures 24-hour and 7-day evidence, measures the configured outcome and economics, then proposes the next move | Choose the KPI and approve or reject each learning before it guides planning |
 
-Lumen distinguishes real MP4 output from simulated placeholders. Simulated output cannot enter the approval or publishing path.
+YouTube Automation Agent distinguishes real MP4 output from simulated placeholders. Simulated output cannot enter the approval or publishing path.
 
 For release history, see [CHANGELOG.md](CHANGELOG.md).
 
@@ -205,8 +207,8 @@ graph TD
     E --> F
     F --> Z[DarkzSEO Discoverability Preflight]
     Z --> G[Review and Approval Gates]
-    G --> H[Publishing & Scheduling Agent]
-    H --> I[Analytics & Optimization Agent]
+    G --> H[Publishing agent (disabled)]
+    H --> I[Analytics & Optimization Agent (YouTube mode)]
     I -->|feedback loop| A
 ```
 
@@ -222,7 +224,7 @@ Each agent handles one stage of the pipeline:
 | **SEO Optimizer** | Keywords, titles, descriptions, tags |
 | **Production** | Coordinates TTS audio, image assets, video assembly |
 | **Discoverability** | Runs versioned, advisory GEO/AIO/AEO content audits through DarkzSEO |
-| **Publishing** | Uploads, schedules, manages playlists |
+| **Publishing** | Publishing agent is present, but YouTube scheduling and uploads are disabled in this implementation |
 | **Analytics** | Tracks performance, feeds insights back to strategy |
 
 ## AI Providers
@@ -268,18 +270,18 @@ Local slideshow rendering remains the default, so upgrading does not start paid 
 | Kuaishou | `kling-v3-omni` | Storyboards and character/voice consistency | 3–15 seconds |
 | Alibaba | Wan 2.7 task-specific models | Efficient generation, reference video, and continuation | 2–15 seconds |
 
-Long-form productions use hybrid assembly: Lumen generates bounded provider clips for the hook and important sections, fills the remaining timeline locally, mixes the existing narration, and keeps the generated caption file alongside the production. As soon as a provider returns its task ID, Lumen persists it before polling so interrupted jobs can resume that known task instead of submitting it again.
+External video generation is a separately configured path. The local slideshow path renders visuals locally and uses FFmpeg to combine them with narration and captions; it does not require external image generation. Provider task IDs are persisted before polling so interrupted jobs can resume known tasks.
 
 ## Configuration
 
 ### API Keys
 
-#### YouTube Data API (required, free)
+#### YouTube Data API (production/YouTube mode)
 
 1. Create a project in [Google Cloud Console](https://console.cloud.google.com/)
 2. Enable **YouTube Data API v3**
 3. Create an OAuth 2.0 client (**Desktop app**, not Web application)
-4. Save the JSON as `config/credentials.json`; AgentTube uses its configured loopback redirect URI exactly
+4. Save the JSON as `config/credentials.json`; the app uses its configured loopback redirect URI. These credentials are not needed for local draft generation in draft-only mode.
 
 #### OpenAI
 
@@ -354,28 +356,22 @@ GENERATION_RETRY_BASE_MS=1000
 
 The dashboard calculates setup, first-real-MP4, approval, publication, and repeat-generation milestones locally from SQLite and files on disk. A video counts only when a non-simulated `.mp4` with an MP4 container signature still exists.
 
-Anonymous milestone reporting is disabled by default and has no built-in collector. It activates only when you explicitly set both telemetry variables. The allowlisted payload contains the milestone name and time, Lumen version, OS family, Node major version, and a random installation ID. It never includes credentials, channel data, prompts, topics, titles, filenames, or video contents.
+Anonymous milestone reporting is disabled by default and has no built-in collector. It activates only when you explicitly set both telemetry variables. The allowlisted payload contains the milestone name and time, YouTube Automation Agent version, OS family, Node major version, and a random installation ID. It never includes credentials, channel data, prompts, topics, titles, filenames, or video contents.
 
 ## Automation Schedule
 
 ```mermaid
-gantt
-    title Daily Pipeline
-    dateFormat HH:mm
-    axisFormat %H:%M
-
-    section Content
-    Generate content (strategy + script + thumbnail + SEO) :06:00, 2h
-
-    section Publishing
-    Process publishing queue :crit, 08:00, 14h
-
-    section Analytics
-    Collect analytics     :09:00, 1h
-    Run optimizations     :22:00, 1h
+flowchart LR
+    CONTENT[Daily content generation<br/>06:00]
+    ANALYTICS[Daily analytics<br/>09:00]
+    OPTIMIZE[Daily optimization<br/>22:00]
+    STRATEGY[Sunday strategy review<br/>08:00]
+    DB[Saturday database maintenance<br/>03:00]
+    COMMENTS[Audience sync<br/>Every 4 hours]
+    EXPERIMENTS[Experiment refresh<br/>Every 4 hours at :30]
 ```
 
-The scheduler runs automatically after `npm start`. Content generation at 06:00, publishing queue processed every 15 minutes, analytics at 09:00, optimization at 22:00. Weekly strategy reviews run on Sundays.
+The scheduler registers tasks without starting them; application startup explicitly starts the registered tasks in production/YouTube mode. Registered tasks are: content generation daily at 06:00; analytics daily at 09:00; optimization daily at 22:00; weekly strategy review Sundays at 08:00; database maintenance Saturdays at 03:00; audience comment sync every four hours; and controlled-experiment refresh every four hours at :30. The publishing queue task is intentionally not registered. Draft-only mode does not start this YouTube scheduler.
 
 When an active channel strategy exists, the 06:00 generation check uses its cadence and launches an autonomous research-and-production run when the content buffer needs work. Without an active strategy, the original topic-selection flow remains in place.
 
@@ -457,7 +453,7 @@ curl -X POST http://localhost:3456/api/experiments/:experimentId/approve \
   -H "Content-Type: application/json" -H "x-api-key: $API_KEY" \
   -d '{"confirmed":true}'
 
-# inspect, edit, and approve content before scheduling
+# inspect, edit, and approve content locally
 curl http://localhost:3456/api/content/:contentId
 curl -X POST http://localhost:3456/api/content/:contentId/approve \
   -H "Content-Type: application/json" \
@@ -465,34 +461,38 @@ curl -X POST http://localhost:3456/api/content/:contentId/approve \
   -d '{"privacyStatus":"private","factChecked":true,"rightsConfirmed":true}'
 ```
 
+In draft-only mode, approval records local review state only. It does not create a YouTube schedule, and publishing/upload remain disabled.
+
 ## Production Pipeline
 
 ```mermaid
 flowchart LR
     subgraph TTS["Audio Generation"]
         direction TB
-        EL[ElevenLabs v3] -.->|fallback| OA[OpenAI TTS]
-        OA -.->|fallback| SIM1[Simulation]
+        EL[ElevenLabs TTS]
+        OA[OpenAI TTS]
+        GM[Gemini TTS]
+        SIM1[Simulation when no TTS key is configured]
     end
 
-    subgraph IMG["Image Generation"]
-        direction TB
-        GPT[GPT Image 2] -.->|fallback| SIM2[Simulation]
+    subgraph LOCAL["Local slideshow mode"]
+        TH[Sharp local thumbnail]
+        SL[Locally rendered text/gradient slides]
     end
 
-    subgraph VID["Video Assembly"]
-        direction TB
-        WAN[Wan 2.7 I2V] -.->|fallback| PW[Playwright Slideshow]
-        PW -.->|fallback| SIM3[Simulation]
+    subgraph EXTERNAL["Separately selected external media providers"]
+        IMG[OpenAI or Gemini image generation]
+        VID[Configured external video provider]
     end
 
-    TTS --> MIX[FFmpeg Mux]
-    IMG --> VID
+    TTS --> MIX[FFmpeg audio/video mux]
+    SL --> MIX
+    IMG -. external image path .-> MIX
     VID --> MIX
-    MIX --> OUT[Final Video]
+    MIX --> OUT[Draft video]
 ```
 
-Each stage has graceful fallbacks. If a paid API key isn't configured, the system simulates that step so the rest of the pipeline still runs.
+The TTS implementation supports ElevenLabs, OpenAI, and Gemini. If no TTS credentials are configured, it can produce simulated audio; simulated narration is not a real narrated video. In local slideshow mode, the thumbnail is rendered locally with Sharp and slideshow visuals are generated locally as text/gradient slides; this mode does not call an image-generation provider. Separately selected image providers can generate image assets, and configured external video providers can generate video clips. Local slideshow assembly uses FFmpeg to combine visuals and narration. These are distinct paths; selecting slideshow does not select or require an image-generation provider.
 
 ## Extending
 
@@ -551,10 +551,10 @@ youtube-automation-agent/
 | `Missing credentials for: an AI provider` | Configure any one provider with `npm run credentials:setup` — OpenAI is not required |
 | `'ffmpeg' is not recognized` / no .mp4 produced | Run `npm install` (fetches the bundled binary), or install FFmpeg and set `FFMPEG_PATH` |
 | Video marked `simulated`, nothing uploads | Check the ✗ lines in the startup capability check — a key or FFmpeg is missing |
-| "Processing publish queue" but nothing publishes | The queue log now shows what's waiting; content publishes at its scheduled time (default: next day 2 PM) |
+| Publishing does not run | YouTube upload is disabled in this implementation, and no publishing-queue scheduler task is registered |
 | YouTube API quota exceeded | Check quotas in Google Cloud Console; reduce posting frequency |
 | Content generation failed | Verify API keys and credits; check `logs/` |
-| Publishing failed | Re-authenticate YouTube OAuth tokens; check video format |
+| YouTube publication requested | Upload is disabled in this implementation; local review and draft generation remain available |
 
 Enable debug logging:
 
@@ -562,24 +562,9 @@ Enable debug logging:
 NODE_ENV=development DEBUG_MODE=true npm start
 ```
 
-## More Tools by darkzOGx
-
-If this was useful, check out:
-
-- [darkzloop](https://github.com/darkzOGx/darkzloop): terminal agent runner that turns any LLM into a disciplined software engineer (FSM control, model-agnostic, BYO auth)
-- [darkzBOX](https://github.com/darkzOGx/darkzBOX): open-source Instantly.ai clone with smart automated email replies
-- [open-sales-researcher](https://github.com/darkzOGx/open-sales-researcher): autonomous B2B company research. Works with Claude Code, Cursor, Copilot.
-- [darkzseo](https://github.com/darkzOGx/darkzseo): SEO tooling
-
-## Built by
-
-[@darkzOGx](https://github.com/darkzOGx), a solo builder shipping AI automation and developer tools. Find me on [X](https://x.com/darkzOGx) and [laderalabs.io](https://laderalabs.io).
-
-If Lumen saves you time, a star helps it reach more developers.
-
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for ground rules (short version: one focused concern per PR, no lockfile churn, lint + tests must pass). For questions and setup help, use [Discussions](https://github.com/darkzOGx/youtube-automation-agent/discussions) — Issues is for bugs.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for ground rules (short version: one focused concern per PR, no lockfile churn, lint + tests must pass). For bugs or setup questions, [open an issue in this repository](https://github.com/akumar/youtube-automation-agent/issues).
 
 1. Fork the repo
 2. Create a feature branch
@@ -587,7 +572,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for ground rules (short version: one focu
 4. Submit a PR
 
 ```bash
-git clone <your-fork>
+git clone https://github.com/akumar/youtube-automation-agent.git
 cd youtube-automation-agent
 npm install
 npm run lint   # must pass — CI runs this on every PR
@@ -609,7 +594,6 @@ MIT — see [LICENSE](LICENSE).
 - [Zhipu AI](https://z.ai/) — GLM-5.3
 - [ElevenLabs](https://elevenlabs.io/) — Eleven v3 TTS
 - [Replicate](https://replicate.com/) — Wan 2.7 video generation
-- [ConstructionBids.ai](https://constructionbids.ai) - AI scans every federal, state & local public works bid and matches you to contracts you'll win.
 
 ---
 
