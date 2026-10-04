@@ -229,7 +229,7 @@ class ProductionManagementAgent {
         originalPath: thumbnail.path,
         dimensions: aiThumbnail.dimensions,
         fileSize: aiThumbnail.fileSize,
-        generatedWith: 'AI'
+        generatedWith: aiThumbnail.generatedWith || 'AI'
       };
     } catch (error) {
       this.logger.error('AI thumbnail generation failed:', error);

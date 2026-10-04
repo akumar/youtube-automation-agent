@@ -35,6 +35,11 @@ class MediaGenerationService {
 
   listProviders() { return this.registry.list(); }
 
+  usesLocalSlideshow(settings, request = {}, selectedProvider = null) {
+    const provider = selectedProvider || this.registry.select(settings.provider, settings.order, request);
+    return provider.id === 'slideshow' || settings.mode === 'slideshow' || settings.maxGeneratedSeconds === 0;
+  }
+
   buildScenePlan(script = {}, visualAssets = [], settings = {}) {
     const prompts = [];
     if (script.hook?.text || script.title) {
@@ -76,7 +81,7 @@ class MediaGenerationService {
     };
     const provider = this.registry.select(settings.provider, settings.order, routingRequest);
     const providerInfo = provider.describe();
-    if (provider.id === 'slideshow' || settings.mode === 'slideshow' || settings.maxGeneratedSeconds === 0) {
+    if (this.usesLocalSlideshow(settings, routingRequest, provider)) {
       return { clips: [], requestedProvider: settings.provider, actualProvider: 'slideshow', model: 'local-ffmpeg', settings };
     }
 

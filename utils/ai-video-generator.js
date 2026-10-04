@@ -7,12 +7,14 @@ const sharp = require('sharp');
 const { Logger } = require('./logger');
 const { runFFmpeg, checkFFmpeg, ffmpegInstallHint, getMediaDuration } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
+const { normalizeSectionContent, durationSeconds } = require('./script-content');
 
 class AIVideoGenerator {
   constructor(credentials, options = {}) {
     this.logger = new Logger('AIVideoGenerator');
     const resolvedCredentials = credentials?.credentials || credentials || {};
     this.db = options.db || null;
+    this.getMediaDuration = getMediaDuration;
     this.lastVideoResult = null;
     this.lastNarrationResult = null;
     
@@ -57,6 +59,16 @@ class AIVideoGenerator {
     this.mediaGeneration = options.mediaGeneration || (this.db
       ? new MediaGenerationService(this.db, resolvedCredentials, { logger: this.logger })
       : null);
+  }
+
+  async usesLocalSlideshow() {
+    if (!this.mediaGeneration) return true;
+    const settings = await this.mediaGeneration.settings();
+    return this.mediaGeneration.usesLocalSlideshow(settings, {
+      duration: settings.clipDuration,
+      generateAudio: settings.generateAudio,
+      firstFrame: null
+    });
   }
 
   async generateTTSAudio(text, outputPath) {
@@ -193,6 +205,11 @@ class AIVideoGenerator {
 
   async generateVisualAssets(prompt, style = "ethereal", count = 1) {
     this.logger.info(`Generating ${count} visual assets with style: ${style}`);
+
+    if (await this.usesLocalSlideshow()) {
+      this.logger.info('Skipping generated images; local slideshow renders text and gradient slides');
+      return [];
+    }
 
     try {
       if (!this.openai && !this.gemini) {
@@ -358,7 +375,7 @@ class AIVideoGenerator {
         }
       }
 
-      const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
+      const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath, options);
       this.lastVideoResult = { requestedProvider: 'slideshow', actualProvider: 'slideshow', model: 'local-ffmpeg', mode: 'slideshow', generatedSeconds: 0, tasks: [], scenes: [] };
       return produced;
     } catch (error) {
@@ -368,7 +385,7 @@ class AIVideoGenerator {
       const reason = error && error.message ? error.message : String(error);
       this.logger.error(`Video provider generation failed; using the local slideshow: ${reason}`, error);
       try {
-        const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
+        const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath, options);
         this.lastVideoResult = {
           requestedProvider: this.lastVideoResult?.requestedProvider || 'configured-provider',
           actualProvider: 'slideshow', model: 'local-ffmpeg', mode: 'fallback', generatedSeconds: 0,
@@ -466,7 +483,7 @@ class AIVideoGenerator {
     return outputPath;
   }
 
-  async generateSlideshowVideo(script, visualAssets, audioPath, outputPath) {
+  async generateSlideshowVideo(script, visualAssets, audioPath, outputPath, options = {}) {
     this.logger.info('Creating slideshow video...');
 
     if (!(await checkFFmpeg())) {
@@ -508,7 +525,7 @@ class AIVideoGenerator {
       }
 
       const videoPath = outputPath.replace('.mp4', '_visual.mp4');
-      const duration = await getMediaDuration(audioPath);
+      const duration = await this.resolveSlideshowDuration(audioPath, script, options);
       await this.renderSlidesToVideo(stills, duration, videoPath);
 
       await this.muxSlideshowToNarration(videoPath, audioPath, outputPath, duration);
@@ -761,6 +778,11 @@ class AIVideoGenerator {
   }
 
   formatSectionContent(section) {
+    if (Array.isArray(section.content)) {
+      return normalizeSectionContent(section).slice(0, 3).map(line =>
+        `<p>${line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>`
+      ).join('');
+    }
     if (section.items && Array.isArray(section.items)) {
       return section.items.slice(0, 3).map(item => 
         `<p>${item.number}. ${item.title}</p>`
@@ -814,6 +836,19 @@ class AIVideoGenerator {
     
     // Convert to duration (150 words per minute)
     return Math.max(30, Math.ceil((totalWords / 150) * 60));
+  }
+
+  async resolveSlideshowDuration(audioPath, script, options = {}) {
+    const suppliedDuration = durationSeconds(options.audioDurationSeconds);
+    if (suppliedDuration) return suppliedDuration;
+
+    try {
+      return await this.getMediaDuration(audioPath);
+    } catch (error) {
+      const fallback = durationSeconds(options.estimatedDuration) || this.calculateScriptDuration(script);
+      this.logger.warn(`Could not measure narration duration; using script estimate (${fallback}s): ${error.message}`);
+      return fallback;
+    }
   }
 
   async muxSlideshowToNarration(videoPath, audioPath, outputPath, audioDurationSeconds) {
@@ -906,6 +941,10 @@ class AIVideoGenerator {
   async generateThumbnail(script, style = "ethereal") {
     this.logger.info('Generating custom thumbnail...');
 
+    if (await this.usesLocalSlideshow()) {
+      return this.generateLocalThumbnail(script, style);
+    }
+
     try {
       if (!this.openai && !this.gemini) {
         return await this.simulateThumbnailGeneration(script, style);
@@ -926,6 +965,51 @@ class AIVideoGenerator {
       this.logger.error('Thumbnail generation failed:', error);
       return await this.simulateThumbnailGeneration(script, style);
     }
+  }
+
+  async generateLocalThumbnail(script = {}, style = 'local') {
+    const escapeXmlText = value => String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+    const title = String(script.title || 'Untitled Video');
+    const words = title.split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = '';
+    for (const word of words) {
+      const next = line ? `${line} ${word}` : word;
+      if (next.length > 25 && line) {
+        lines.push(line);
+        line = word;
+      } else line = next;
+    }
+    if (line) lines.push(line);
+    const visibleLines = lines.slice(0, 3);
+    if (lines.length > 3) visibleLines[2] = `${visibleLines[2].slice(0, 21)}…`;
+    const titleSvg = visibleLines.map((value, index) =>
+      `<text x="88" y="${320 + index * 82}" fill="#ffffff" font-family="Arial, sans-serif" font-size="64" font-weight="700">${escapeXmlText(value)}</text>`
+    ).join('');
+    const safeStyle = escapeXmlText(style);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+      <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#101b45"/><stop offset="1" stop-color="#713f92"/></linearGradient></defs>
+      <rect width="1280" height="720" fill="url(#bg)"/><circle cx="1080" cy="110" r="210" fill="#76d7cf" opacity=".16"/>
+      <path d="M0 590 Q420 470 1280 650 V720 H0Z" fill="#f4bf56" opacity=".22"/>
+      <text x="88" y="150" fill="#8df0d4" font-family="Arial, sans-serif" font-size="26" font-weight="700" letter-spacing="5">LOCAL DRAFT</text>
+      ${titleSvg}
+      <text x="88" y="640" fill="#d8e4ff" font-family="Arial, sans-serif" font-size="24">${safeStyle}</text>
+    </svg>`;
+    const outputPath = path.join(__dirname, '..', 'uploads', 'thumbnails', `thumbnail_local_${Date.now()}.png`);
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await sharp(Buffer.from(svg)).png().toFile(outputPath);
+    const metadata = await sharp(outputPath).metadata();
+    return {
+      path: outputPath,
+      dimensions: { width: metadata.width, height: metadata.height },
+      fileSize: await this.getFileSize(outputPath),
+      generatedWith: 'local-slideshow'
+    };
   }
 
   async getFileSize(filePath) {

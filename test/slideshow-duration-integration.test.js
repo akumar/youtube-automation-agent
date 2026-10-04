@@ -44,3 +44,29 @@ test('slideshow mux loops short visuals and ends with 60-second narration', asyn
   assert.ok(Math.abs(extendedDuration - audioDuration) < 0.5, 'looped mux should end with narration');
   t.diagnostic(JSON.stringify({ audioDuration, visualDuration, finalDuration, shortDuration, extendedDuration }));
 });
+
+
+test('local slideshow renderer uses the measured narration duration', async t => {
+  if (!(await checkFFmpeg())) return t.skip('FFmpeg is unavailable');
+  const { chromium } = require('playwright');
+  try {
+    await fs.access(chromium.executablePath());
+  } catch (_error) {
+    return t.skip('Playwright Chromium is unavailable');
+  }
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'slideshow-render-duration-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const audio = path.join(dir, 'narration.m4a');
+  await runFFmpeg(['-y', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100', '-t', '8', '-c:a', 'aac', audio]);
+  const audioDuration = await getMediaDuration(audio);
+  const output = path.join(dir, 'local-slideshow.mp4');
+  const generator = new AIVideoGenerator({});
+  const script = { title: 'Local renderer test', mainContent: { sections: [{ title: 'Array content', content: ['Locally rendered spoken content.'] }] } };
+
+  await generator.generateSlideshowVideo(script, [], audio, output, { audioDurationSeconds: audioDuration });
+  const visualDuration = await getMediaDuration(output.replace('.mp4', '_visual.mp4'));
+  const finalDuration = await getMediaDuration(output);
+  assert.ok(Math.abs(visualDuration - audioDuration) <= 0.35, 'local visual track should match measured narration');
+  assert.ok(Math.abs(finalDuration - audioDuration) <= 0.35, 'local slideshow output should match measured narration');
+});
