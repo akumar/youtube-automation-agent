@@ -1,5 +1,6 @@
 const { Logger } = require('../utils/logger');
 const { AITextService } = require('../utils/ai-text-service');
+const { normalizeSectionContent, estimateTextDuration } = require('../utils/script-content');
 
 class ScriptWriterAgent {
   constructor(db, credentials) {
@@ -271,19 +272,16 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
     return sections
       .slice(0, 8)
       .map((section, index) => {
-        const rawContent = Array.isArray(section.content)
-          ? section.content
-          : [section.content || section.summary || section.description];
-        const content = rawContent
-          .filter(Boolean)
-          .map(line => String(line).trim())
-          .filter(Boolean);
+        const sectionContent = section.content == null && !section.steps && !section.items
+          ? { ...section, content: section.summary || section.description }
+          : section;
+        const content = normalizeSectionContent(sectionContent);
 
         return {
           type: 'ai_generated',
           title: String(section.title || `${strategy.topic} Part ${index + 1}`).trim(),
           content,
-          duration: parseInt(section.duration, 10) || 60
+          duration: estimateTextDuration(content.join(' '))
         };
       })
       .filter(section => section.title && section.content.length > 0);
@@ -818,7 +816,8 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
 
   estimateDuration(mainContent) {
     const totalSeconds = mainContent.sections.reduce((total, section) => {
-      return total + (section.duration || 60);
+      const spokenText = normalizeSectionContent(section).join(' ');
+      return total + (section.duration || estimateTextDuration(spokenText));
     }, 0);
     
     // Add hook, intro, conclusion, CTA

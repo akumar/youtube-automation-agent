@@ -1,5 +1,6 @@
 const { Logger } = require('../utils/logger');
 const { AITextService } = require('../utils/ai-text-service');
+const { getSectionSpokenText, estimateTextDuration, durationSeconds } = require('../utils/script-content');
 
 class SEOOptimizerAgent {
   constructor(db, credentials) {
@@ -139,18 +140,52 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     const text = String(response || '').trim();
     const withoutFences = text
       .replace(/^```(?:json)?\s*/i, '')
-      .replace(/```$/i, '')
+      .replace(/\s*```$/i, '')
       .trim();
 
     try {
-      return JSON.parse(withoutFences);
-    } catch (error) {
-      const match = withoutFences.match(/\{[\s\S]*\}/);
-      if (!match) {
-        throw error;
-      }
-      return JSON.parse(match[0]);
+      const parsed = JSON.parse(withoutFences);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch (_) {
+      // Allow a short provider prefix before one complete JSON object.
     }
+
+    const start = withoutFences.indexOf('{');
+    if (start !== -1) {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let index = start; index < withoutFences.length; index++) {
+        const character = withoutFences[index];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (character === '\\') escaped = true;
+          else if (character === '"') inString = false;
+          continue;
+        }
+
+        if (character === '"') inString = true;
+        else if (character === '{') depth++;
+        else if (character === '}' && --depth === 0) {
+          if (withoutFences.slice(index + 1).trim()) break;
+          try {
+            const parsed = JSON.parse(withoutFences.slice(start, index + 1));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+          } catch (_) {
+            break;
+          }
+        }
+      }
+    }
+
+    throw new Error('AI SEO response does not contain a valid JSON object');
+  }
+
+  sectionDurationSeconds(section) {
+    const declaredDuration = durationSeconds(section.duration);
+    if (declaredDuration) return declaredDuration;
+    const spokenText = getSectionSpokenText(section);
+    return spokenText ? estimateTextDuration(spokenText) : 60;
   }
 
   normalizeAITags(tags, strategy) {
@@ -247,7 +282,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
         const minutes = Math.floor(timestamp / 60);
         const seconds = timestamp % 60;
         description += `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')} ${section.title || 'Section'}\n`;
-        timestamp += section.duration || 60;
+        timestamp += this.sectionDurationSeconds(section);
       });
     }
     description += '\n';
@@ -521,7 +556,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
           seconds: currentTime
         });
         
-        currentTime += section.duration || 60;
+        currentTime += this.sectionDurationSeconds(section);
       });
     }
     
