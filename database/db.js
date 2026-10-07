@@ -6,7 +6,9 @@ const { Logger } = require('../utils/logger');
 
 class Database {
   constructor() {
-    this.dbPath = path.join(__dirname, '..', 'data', 'youtube_automation.db');
+    this.dbPath = process.env.YOUTUBE_AUTOMATION_DB_PATH
+      ? path.resolve(process.env.YOUTUBE_AUTOMATION_DB_PATH)
+      : path.join(__dirname, '..', 'data', 'youtube_automation.db');
     this.db = null;
     this.logger = new Logger('Database');
   }
@@ -14,6 +16,7 @@ class Database {
   async initialize() {
     try {
       this.logger.info('Initializing database...');
+      this.logger.info(`Resolved database path: ${this.dbPath}`);
       
       // Ensure data directory exists
       await fs.mkdir(path.dirname(this.dbPath), { recursive: true });
@@ -1671,6 +1674,66 @@ class Database {
       await new Promise(resolve => connection.close(() => resolve()));
     }
     return { approval: await this.getContentApproval(productionId), scheduleEntry };
+  }
+
+  async approveContentLocally(input = {}) {
+    const { productionId, expectedRevision, review = {}, decision = {} } = input;
+    if (!productionId || !expectedRevision) {
+      const error = new Error('Local approval requires the reviewed content revision');
+      error.status = 400;
+      error.code = 'INVALID_APPROVAL_REQUEST';
+      throw error;
+    }
+    const connection = new sqlite3.Database(this.dbPath);
+    connection.configure('busyTimeout', 5000);
+    let transactionStarted = false;
+    try {
+      await this.executeOn(connection, 'BEGIN IMMEDIATE TRANSACTION');
+      transactionStarted = true;
+      const actualRevision = await this.getContentRevision(productionId, connection);
+      if (!actualRevision || actualRevision !== expectedRevision) {
+        const error = new Error('The content changed while approval was being reviewed; reload and review the current revision');
+        error.status = 409;
+        error.code = 'STALE_CONTENT_REVISION';
+        throw error;
+      }
+      await this.executeOn(connection,
+        `INSERT INTO content_reviews (
+          production_id, status, editor_data, quality_checks, review_notes, reviewed_at, updated_at
+        ) VALUES (?, 'approved', ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(production_id) DO UPDATE SET
+          status = 'approved', editor_data = excluded.editor_data,
+          quality_checks = excluded.quality_checks, review_notes = excluded.review_notes,
+          reviewed_at = excluded.reviewed_at, updated_at = datetime('now')`,
+        [productionId, JSON.stringify(review.editorData || {}), JSON.stringify(review.qualityChecks || []),
+          review.reviewNotes || null, review.reviewedAt || new Date().toISOString()]);
+      const currentRevision = await this.getContentRevision(productionId, connection);
+      const currentApproval = await this.getRowFrom(connection,
+        'SELECT status FROM content_approvals WHERE production_id = ?', [productionId]);
+      const previousStatus = currentApproval?.status || 'pending';
+      await this.executeOn(connection,
+        `INSERT OR IGNORE INTO content_approvals (production_id, status) VALUES (?, 'pending')`, [productionId]);
+      const reviewNotes = String(decision.reviewNotes || 'Approved by operator').trim();
+      const reviewedBy = String(decision.reviewedBy || 'local-operator').trim();
+      const reviewedAt = new Date().toISOString();
+      await this.executeOn(connection,
+        `UPDATE content_approvals SET status = 'approved', review_notes = ?, reviewed_by = ?,
+         reviewed_at = ?, approved_revision = ?, updated_at = datetime('now') WHERE production_id = ?`,
+        [reviewNotes, reviewedBy, reviewedAt, currentRevision, productionId]);
+      await this.executeOn(connection,
+        `INSERT INTO content_approval_events (
+          id, production_id, previous_status, status, review_notes, reviewed_by, content_revision, created_at
+        ) VALUES (?, ?, ?, 'approved', ?, ?, ?, datetime('now'))`,
+        [this.generateId('approval_event'), productionId, previousStatus, reviewNotes, reviewedBy, currentRevision]);
+      await this.executeOn(connection, 'COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) await this.executeOn(connection, 'ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      await new Promise(resolve => connection.close(() => resolve()));
+    }
+    return { approval: await this.getContentApproval(productionId) };
   }
 
   async getContentApprovalHistory(productionId) {

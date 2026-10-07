@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { AIVideoGenerator } = require('../utils/ai-video-generator');
 const { normalizeSectionContent, getSectionSpokenText, estimateTextDuration } = require('../utils/script-content');
+const { ProductionManagementAgent } = require('../agents/production-management-agent');
 const { ScriptWriterAgent } = require('../agents/script-writer-agent');
 
 test('slideshow mux forwards measured narration duration to the looped mux', async () => {
@@ -46,3 +47,14 @@ test('ScriptWriter normalizes structured step and item sections before estimatin
     assert.ok(section.content.length > 0);
     assert.equal(section.duration, estimateTextDuration(section.content.join(' ')));
   });
+});
+
+test('draft-only keeps the strategy recommendation but leaves actual scheduled time empty', () => {
+  const recommendedTime = '2026-10-08T08:30:00.000Z';
+  const draftAgent = new ProductionManagementAgent({}, {}, { draftOnly: true });
+  const productionAgent = new ProductionManagementAgent({}, {}, { draftOnly: false });
+
+  assert.equal(draftAgent.getScheduledPublishTime({ bestPublishTime: recommendedTime }), null);
+  assert.equal(productionAgent.getScheduledPublishTime({ bestPublishTime: recommendedTime }), recommendedTime);
+  assert.equal(draftAgent.calculatePublishTime({ bestPublishTime: recommendedTime }), recommendedTime);
+});

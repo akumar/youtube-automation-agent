@@ -33,22 +33,37 @@ function buildYouTubeVideoMetadata(scheduleEntry, options, now, defaultPrivacySt
 }
 
 class PublishingSchedulingAgent {
-  constructor(db, credentials) {
+  constructor(db, credentials, options = {}) {
     this.db = db;
     this.credentials = credentials;
     this.logger = new Logger('PublishingScheduling');
     this.youtube = null;
     this.publishQueue = [];
+    this.draftOnlyMode = process.env.YOUTUBE_AUTOMATION_DRAFT_ONLY === 'true' || options.draftOnly === true;
+  }
+
+  assertPublishingEnabled(operation = 'Publishing') {
+    if (!this.draftOnlyMode) return;
+    const error = new Error(`${operation} is disabled in draft-only mode`);
+    error.status = 403;
+    error.code = 'DRAFT_ONLY_PUBLISHING_DISABLED';
+    throw error;
   }
 
   async initialize() {
     this.logger.info('Initializing Publishing & Scheduling Agent...');
+    if (this.draftOnlyMode) {
+      this.publishQueue = [];
+      this.logger.info('Draft-only mode: YouTube authorization and publish queue remain dormant');
+      return true;
+    }
     await this.setupYouTubeAPI();
     await this.loadPublishQueue();
     return true;
   }
 
   async setupYouTubeAPI() {
+    this.assertPublishingEnabled('YouTube authorization');
     try {
       const auth = this.credentials.getYouTubeAuth();
       this.youtube = google.youtube({ version: 'v3', auth });
@@ -70,6 +85,7 @@ class PublishingSchedulingAgent {
   }
 
   async scheduleContent(productionData, approvalContext = null) {
+    this.assertPublishingEnabled('Scheduling');
     try {
       const candidate = await this.prepareScheduleEntry(productionData);
       if (!candidate) return null;
@@ -148,6 +164,7 @@ class PublishingSchedulingAgent {
   }
 
   async publishContent(contentId, options = {}) {
+    this.assertPublishingEnabled();
     try {
       let productionBundle = null;
       if (this.db.getLatestReadinessRun) {
@@ -313,6 +330,7 @@ class PublishingSchedulingAgent {
   }
 
   async reconcileUploadedVideo(scheduleEntry, expectedRevision) {
+    this.assertPublishingEnabled();
     const response = await this.youtube.videos.list({ part: 'id,status', id: scheduleEntry.youtubeId });
     if (!response.data.items?.some(video => video.id === scheduleEntry.youtubeId)) {
       scheduleEntry.status = 'reconciliation_required';
@@ -468,6 +486,7 @@ class PublishingSchedulingAgent {
   }
 
   async processPublishQueue() {
+    this.assertPublishingEnabled('Publish queue processing');
     const now = new Date();
     const scheduled = this.publishQueue
       .filter(entry => entry.status === 'scheduled')
@@ -697,6 +716,7 @@ class PublishingSchedulingAgent {
   }
 
   async emergencyPublish(contentId, delayMinutes = 0) {
+    this.assertPublishingEnabled('Publishing and scheduling');
     // For urgent publishing needs
     this.logger.info(`Emergency publish requested: ${contentId}`);
 
@@ -717,6 +737,7 @@ class PublishingSchedulingAgent {
   }
 
   async pauseScheduledContent(contentId) {
+    this.assertPublishingEnabled('Scheduling');
     const entry = this.publishQueue.find(e => 
       e.productionId === contentId || e.id === contentId
     );
@@ -734,6 +755,7 @@ class PublishingSchedulingAgent {
   }
 
   async resumeScheduledContent(contentId, newPublishTime = null) {
+    this.assertPublishingEnabled('Scheduling');
     const entry = this.publishQueue.find(e => 
       e.productionId === contentId || e.id === contentId
     );
@@ -758,6 +780,7 @@ class PublishingSchedulingAgent {
   }
 
   async rescheduleContent(contentId, newPublishTime) {
+    this.assertPublishingEnabled('Scheduling');
     const publishTime = new Date(newPublishTime);
     if (!Number.isFinite(publishTime.getTime()) || publishTime.getTime() <= Date.now()) {
       const error = new Error('Choose a future publish time');
@@ -787,6 +810,7 @@ class PublishingSchedulingAgent {
   }
 
   async deleteScheduledContent(contentId) {
+    this.assertPublishingEnabled('Scheduling');
     const entry = this.publishQueue.find(item => item.productionId === contentId || item.id === contentId) ||
       await this.db.getLatestScheduleEntry?.(contentId);
     if (!entry) {

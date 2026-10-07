@@ -5,9 +5,10 @@ const { AIVideoGenerator } = require('../utils/ai-video-generator');
 const { SceneRepairService } = require('../utils/scene-repair-service');
 
 class ProductionManagementAgent {
-  constructor(db, credentials) {
+  constructor(db, credentials, options = {}) {
     this.db = db;
     this.credentials = credentials;
+    this.draftOnlyMode = process.env.YOUTUBE_AUTOMATION_DRAFT_ONLY === 'true' || options.draftOnly === true;
     this.logger = new Logger('ProductionManagement');
     this.pipeline = [];
     this.assets = new Map();
@@ -78,7 +79,7 @@ class ProductionManagementAgent {
           captionsGenerated: null,
           readyForUpload: null
         },
-        scheduledPublishTime: this.calculatePublishTime(strategy),
+        scheduledPublishTime: this.getScheduledPublishTime(strategy),
         priority: this.calculatePriority(strategy),
         estimatedDuration: script.duration,
         createdAt: new Date().toISOString()
@@ -270,6 +271,10 @@ class ProductionManagementAgent {
     tomorrow.setHours(14, 0, 0, 0); // 2 PM default
     
     return tomorrow.toISOString();
+  }
+
+  getScheduledPublishTime(strategy) {
+    return this.draftOnlyMode ? null : this.calculatePublishTime(strategy);
   }
 
   calculatePriority(strategy) {

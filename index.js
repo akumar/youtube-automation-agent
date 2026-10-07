@@ -52,6 +52,7 @@ class YouTubeAutomationAgent {
     this.experiments = null;
     this.discoverability = null;
     this.setupRequired = false;
+    this.draftOnlyMode = process.env.YOUTUBE_AUTOMATION_DRAFT_ONLY === 'true';
   }
 
   async initialize() {
@@ -87,6 +88,17 @@ class YouTubeAutomationAgent {
       // Load credentials
       this.logger.info('Loading credentials...');
       this.credentials = new CredentialManager();
+      if (this.draftOnlyMode) {
+        // Draft generation uses AI provider credentials only; never load YouTube tokens/auth here.
+        await this.credentials.loadCredentials();
+        this.setupRequired = false;
+        await this.initializeAgents({ draftOnly: true });
+        this.scenes = this.agents.production.sceneRepair;
+        this.setupAPI();
+        this.isInitialized = true;
+        this.logger.warn('Draft-only mode is enabled; YouTube auth and publishing remain dormant');
+        return true;
+      }
       const credentialsValid = await this.credentials.validateAll();
       this.readiness = new ProductionReadinessService(this.db, this.credentials);
       
@@ -154,19 +166,23 @@ class YouTubeAutomationAgent {
     }
   }
 
-  async initializeAgents() {
+  async initializeAgents({ draftOnly = false } = {}) {
     this.agents = {
       strategy: new ContentStrategyAgent(this.db, this.credentials),
       scriptWriter: new ScriptWriterAgent(this.db, this.credentials),
       thumbnailDesigner: new ThumbnailDesignerAgent(this.db, this.credentials),
       seoOptimizer: new SEOOptimizerAgent(this.db, this.credentials),
-      production: new ProductionManagementAgent(this.db, this.credentials),
-      publishing: new PublishingSchedulingAgent(this.db, this.credentials),
+      production: new ProductionManagementAgent(this.db, this.credentials, { draftOnly }),
+      publishing: new PublishingSchedulingAgent(this.db, this.credentials, { draftOnly }),
       analytics: new AnalyticsOptimizationAgent(this.db, this.credentials)
     };
 
     // Initialize each agent
-    for (const [name, agent] of Object.entries(this.agents)) {
+    const initializedAgents = draftOnly
+      ? ['strategy', 'scriptWriter', 'thumbnailDesigner', 'seoOptimizer', 'production']
+      : Object.keys(this.agents);
+    for (const name of initializedAgents) {
+      const agent = this.agents[name];
       await agent.initialize();
       this.logger.info(`✓ ${name} agent initialized`);
     }
@@ -404,7 +420,7 @@ class YouTubeAutomationAgent {
     // Manual content generation
     this.app.post('/generate', this.requireAPIKey(), async (req, res) => {
       try {
-        if (this.setupRequired) {
+        if (this.setupRequired && !this.draftOnlyMode) {
           return res.status(503).json({ success: false, error: 'Finish setup with npm run walkthrough before generating content' });
         }
         const validation = this.validateGenerateRequestBody(req.body);
@@ -456,6 +472,7 @@ class YouTubeAutomationAgent {
     // Manual publish
     this.app.post('/publish/:contentId', this.requireAPIKey(), async (req, res) => {
       try {
+        if (this.draftOnlyMode) return res.status(403).json({ success: false, error: 'Publishing is disabled in draft-only mode' });
         if (!this.agents.publishing) return res.status(503).json({ success: false, error: 'YouTube publishing is not configured' });
         const { contentId } = req.params;
         const bundle = await this.db.getProductionBundle(contentId);
@@ -521,6 +538,7 @@ class YouTubeAutomationAgent {
           system: {
             initialized: this.isInitialized,
             setupRequired: this.setupRequired,
+            draftOnlyMode: this.draftOnlyMode,
             uptime: process.uptime(),
             activeJobs: this.activeJobs.size,
             automationPaused: this.scheduler ? !this.scheduler.isEnabled : true,
@@ -681,6 +699,7 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/content/:productionId/shorts/:clipId/approve', protect, async (req, res) => {
       try {
+        if (this.draftOnlyMode) return res.status(403).json({ success: false, error: 'Short scheduling is disabled in draft-only mode', code: 'DRAFT_ONLY_SCHEDULING_DISABLED' });
         if (!this.shorts) return res.status(503).json({ error: 'Shorts repurposing requires completed setup' });
         const result = await this.shorts.approve(req.params.productionId, req.params.clipId, req.body || {});
         return res.json({ success: true, result });
@@ -889,7 +908,7 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/operator/start', protect, async (req, res) => {
       try {
-        if (this.setupRequired || !this.agents.strategy) {
+        if (this.draftOnlyMode || this.setupRequired || !this.agents.strategy) {
           return res.status(503).json({ success: false, error: 'Finish setup with npm run walkthrough before activating the autonomous operator' });
         }
         if (this.activeJobs.size) {
@@ -952,7 +971,7 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/operator/runs/:runId/resume', protect, async (req, res) => {
       try {
-        if (this.setupRequired || !this.agents.strategy) {
+        if (this.draftOnlyMode || this.setupRequired || !this.agents.strategy) {
           return res.status(503).json({ success: false, error: 'Finish setup before resuming the autonomous operator' });
         }
         await this.readiness?.assertReady('Autonomous production recovery');
@@ -1011,6 +1030,7 @@ class YouTubeAutomationAgent {
 
     this.app.patch('/api/content/:productionId/schedule', protect, async (req, res) => {
       try {
+        if (this.draftOnlyMode) return res.status(403).json({ success: false, error: 'Scheduling is disabled in draft-only mode', code: 'DRAFT_ONLY_SCHEDULING_DISABLED' });
         if (!this.agents.publishing) return res.status(503).json({ error: 'Publishing requires completed setup' });
         const result = await this.agents.publishing.rescheduleContent(req.params.productionId, req.body?.publishTime);
         return res.json({ success: true, result });
@@ -1021,6 +1041,7 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/content/:productionId/publish-now', protect, async (req, res) => {
       try {
+        if (this.draftOnlyMode) return res.status(403).json({ success: false, error: 'Publishing is disabled in draft-only mode', code: 'DRAFT_ONLY_PUBLISHING_DISABLED' });
         if (!this.agents.publishing) return res.status(503).json({ error: 'Publishing requires completed setup' });
         const result = await this.agents.publishing.emergencyPublish(req.params.productionId);
         return res.json({ success: true, result });
@@ -1031,6 +1052,7 @@ class YouTubeAutomationAgent {
 
     this.app.delete('/api/content/:productionId/schedule', protect, async (req, res) => {
       try {
+        if (this.draftOnlyMode) return res.status(403).json({ success: false, error: 'Scheduling operations are disabled in draft-only mode', code: 'DRAFT_ONLY_SCHEDULING_DISABLED' });
         if (!this.agents.publishing) return res.status(503).json({ error: 'Publishing requires completed setup' });
         const result = await this.agents.publishing.deleteScheduledContent(req.params.productionId);
         return res.json({ success: true, result });
@@ -1285,7 +1307,7 @@ class YouTubeAutomationAgent {
   }
 
   async startGenerationJob(input = {}) {
-    if (this.setupRequired || !this.agents.strategy) {
+    if ((this.setupRequired && !this.draftOnlyMode) || !this.agents.strategy) {
       const error = new Error('Finish setup with npm run walkthrough before generating content');
       error.status = 503;
       throw error;
@@ -1320,7 +1342,7 @@ class YouTubeAutomationAgent {
   }
 
   async resumeGenerationJob(jobId, options = {}) {
-    if (this.setupRequired || !this.agents.strategy) {
+    if ((this.setupRequired && !this.draftOnlyMode) || !this.agents.strategy) {
       const error = new Error('Finish setup with npm run walkthrough before resuming content generation');
       error.status = 503;
       throw error;
@@ -1800,6 +1822,26 @@ class YouTubeAutomationAgent {
       throw error;
     }
 
+    const approvalInput = {
+      productionId: bundle.id,
+      expectedRevision: bundle.contentRevision,
+      review: {
+        editorData, qualityChecks: quality.checks,
+        reviewNotes: input.reviewNotes || 'Approved by operator', reviewedAt: new Date().toISOString()
+      },
+      decision: {
+        reviewNotes: input.reviewNotes || 'Approved by operator', reviewedBy: 'local-operator'
+      }
+    };
+    if (this.draftOnlyMode) {
+      const persisted = await this.db.approveContentLocally(approvalInput);
+      await this.operator.notify({
+        type: 'content_approved', level: 'success', title: 'Draft approved',
+        message: `${productionData.script.title} is approved locally and was not scheduled`,
+        data: { productionId }
+      });
+      return { productionId, reviewStatus: 'approved', qualityScore: quality.score, schedule: null, approval: persisted.approval };
+    }
     const existingSchedule = bundle.schedule?.status === 'published' ? null : bundle.schedule;
     const scheduleEntry = await this.agents.publishing.prepareScheduleEntry(productionData, existingSchedule || {});
     if (!scheduleEntry) {
@@ -1807,19 +1849,7 @@ class YouTubeAutomationAgent {
       error.status = 409;
       throw error;
     }
-
-    const persisted = await this.db.approveContentAndSchedule({
-      productionId: bundle.id,
-      expectedRevision: bundle.contentRevision,
-      review: {
-        editorData, qualityChecks: quality.checks,
-        reviewNotes: input.reviewNotes || 'Approved by operator', reviewedAt: new Date().toISOString()
-      },
-      scheduleEntry,
-      decision: {
-        reviewNotes: input.reviewNotes || 'Approved by operator', reviewedBy: 'local-operator'
-      }
-    });
+    const persisted = await this.db.approveContentAndSchedule({ ...approvalInput, scheduleEntry });
     await this.agents.publishing.loadPublishQueue();
     await this.operator.notify({
       type: 'content_approved', level: 'success', title: 'Content approved',
@@ -1838,7 +1868,8 @@ class YouTubeAutomationAgent {
     }
     
     const PORT = process.env.PORT || 3456;
-    this.app.listen(PORT, () => {
+    const HOST = process.env.HOST || '127.0.0.1';
+    this.app.listen(PORT, HOST, () => {
       console.log(chalk.green(`\n✅ YouTube Automation Agent running on port ${PORT}`));
       console.log(chalk.gray('─'.repeat(50)));
       console.log(chalk.white('📊 Dashboard: ') + chalk.cyan(`http://localhost:${PORT}`));
@@ -1846,7 +1877,9 @@ class YouTubeAutomationAgent {
       console.log(chalk.white('📅 Schedule: ') + chalk.cyan(`http://localhost:${PORT}/schedule`));
       console.log(chalk.white('📈 Analytics: ') + chalk.cyan(`http://localhost:${PORT}/analytics`));
       console.log(chalk.gray('─'.repeat(50)));
-      if (this.setupRequired) {
+      if (this.draftOnlyMode) {
+        console.log(chalk.yellow('\n📝 Draft-only mode is active. Credentials, scheduled jobs, and YouTube uploads remain disabled.'));
+      } else if (this.setupRequired) {
         console.log(chalk.yellow('\n⚙️  Setup is required. The dashboard is available; run npm run walkthrough to enable generation.'));
       } else {
         console.log(chalk.yellow('\n🤖 Automation is active. Approved content will be published on schedule.'));

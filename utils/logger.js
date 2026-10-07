@@ -2,6 +2,45 @@ const winston = require('winston');
 const path = require('path');
 const chalk = require('chalk');
 
+const SENSITIVE_FIELD = /(?:api[_-]?key|authorization|auth(?:orization)?[_-]?header|access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|password|passwd|secret|credential|cookie)/i;
+const SECRET_ASSIGNMENT = /\b(api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|password|passwd|secret|credential|cookie)\b(\s*[:=]\s*)(?:Bearer\s+)?("[^"]*"|'[^']*'|[^\s,;&}"']+)/gi;
+const BEARER_VALUE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
+
+function sanitizeString(value) {
+  return value
+    .replace(SECRET_ASSIGNMENT, (_match, field, separator) => `${field}${separator}[REDACTED]`)
+    .replace(BEARER_VALUE, 'Bearer [REDACTED]');
+}
+
+function sanitizeLogValue(value, fieldName = '', seen = new WeakSet()) {
+  if (SENSITIVE_FIELD.test(fieldName)) return '[REDACTED]';
+  if (typeof value === 'string') return sanitizeString(value);
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+
+  if (value instanceof Error) {
+    const safeError = {
+      name: sanitizeLogValue(value.name, 'name', seen),
+      message: sanitizeLogValue(value.message, 'message', seen),
+      stack: sanitizeLogValue(value.stack, 'stack', seen)
+    };
+    for (const [key, nested] of Object.entries(value)) {
+      safeError[key] = sanitizeLogValue(nested, key, seen);
+    }
+    return safeError;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeLogValue(item, '', seen));
+  }
+
+  return Object.fromEntries(Object.entries(value).map(([key, nested]) => [
+    key,
+    sanitizeLogValue(nested, key, seen)
+  ]));
+}
+
 class Logger {
   constructor(component = 'System') {
     this.component = component;
@@ -9,7 +48,7 @@ class Logger {
   }
 
   createWinstonLogger() {
-    const logDir = path.join(__dirname, '..', 'logs');
+    const logDir = process.env.YOUTUBE_AUTOMATION_LOG_DIR || path.join(__dirname, '..', 'logs');
     
     return winston.createLogger({
       level: process.env.LOG_LEVEL || 'info',
@@ -46,36 +85,41 @@ class Logger {
   }
 
   info(message, ...args) {
-    this.winston.info(message, ...args);
-    console.log(this.formatConsoleMessage('INFO', message, chalk.blue));
+    const safeMessage = sanitizeLogValue(message);
+    this.winston.info(safeMessage, ...sanitizeLogValue(args));
+    console.log(this.formatConsoleMessage('INFO', safeMessage, chalk.blue));
   }
 
   success(message, ...args) {
-    this.winston.info(message, ...args);
-    console.log(this.formatConsoleMessage('SUCCESS', message, chalk.green));
+    const safeMessage = sanitizeLogValue(message);
+    this.winston.info(safeMessage, ...sanitizeLogValue(args));
+    console.log(this.formatConsoleMessage('SUCCESS', safeMessage, chalk.green));
   }
 
   warn(message, ...args) {
-    this.winston.warn(message, ...args);
-    console.log(this.formatConsoleMessage('WARN', message, chalk.yellow));
+    const safeMessage = sanitizeLogValue(message);
+    this.winston.warn(safeMessage, ...sanitizeLogValue(args));
+    console.log(this.formatConsoleMessage('WARN', safeMessage, chalk.yellow));
   }
 
   error(message, error = null, ...args) {
+    const safeMessage = sanitizeLogValue(message);
     if (error) {
-      this.winston.error(message, { error: error.message, stack: error.stack, ...args });
+      this.winston.error(safeMessage, sanitizeLogValue({ error: error.message, stack: error.stack, ...args }));
     } else {
-      this.winston.error(message, ...args);
+      this.winston.error(safeMessage, ...sanitizeLogValue([error, ...args].filter(value => value !== null)));
     }
-    console.log(this.formatConsoleMessage('ERROR', message, chalk.red));
+    console.log(this.formatConsoleMessage('ERROR', safeMessage, chalk.red));
     if (error && process.env.NODE_ENV !== 'production') {
-      console.error(chalk.red(error.stack));
+      console.error(chalk.red(sanitizeLogValue(error.stack)));
     }
   }
 
   debug(message, ...args) {
-    this.winston.debug(message, ...args);
+    const safeMessage = sanitizeLogValue(message);
+    this.winston.debug(safeMessage, ...sanitizeLogValue(args));
     if (process.env.NODE_ENV !== 'production') {
-      console.log(this.formatConsoleMessage('DEBUG', message, chalk.gray));
+      console.log(this.formatConsoleMessage('DEBUG', safeMessage, chalk.gray));
     }
   }
 
@@ -114,48 +158,48 @@ class Logger {
 
   // Structured logging for important events
   logEvent(eventType, data = {}) {
-    this.winston.info('System Event', {
+    this.winston.info('System Event', sanitizeLogValue({
       eventType,
       timestamp: new Date().toISOString(),
       ...data
-    });
+    }));
   }
 
   // Log content generation pipeline
   logContentPipeline(stage, contentId, status, data = {}) {
-    this.winston.info('Content Pipeline', {
+    this.winston.info('Content Pipeline', sanitizeLogValue({
       stage,
       contentId,
       status,
       timestamp: new Date().toISOString(),
       ...data
-    });
+    }));
   }
 
   // Log publishing events
   logPublishing(action, videoId, status, data = {}) {
-    this.winston.info('Publishing Event', {
+    this.winston.info('Publishing Event', sanitizeLogValue({
       action,
       videoId,
       status,
       timestamp: new Date().toISOString(),
       ...data
-    });
+    }));
   }
 
   // Log analytics events
   logAnalytics(videoId, metrics, insights = []) {
-    this.winston.info('Analytics Update', {
+    this.winston.info('Analytics Update', sanitizeLogValue({
       videoId,
       metrics,
       insights,
       timestamp: new Date().toISOString()
-    });
+    }));
   }
 
   // Log errors with context
   logErrorWithContext(error, context = {}) {
-    this.winston.error('System Error', {
+    this.winston.error('System Error', sanitizeLogValue({
       error: {
         message: error.message,
         stack: error.stack,
@@ -163,7 +207,7 @@ class Logger {
       },
       context,
       timestamp: new Date().toISOString()
-    });
+    }));
   }
 }
 
